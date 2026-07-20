@@ -1,0 +1,14 @@
+# sekrety
+.env
+
+# dane wrażliwe klientów / wyciągi bankowe — nigdy nie commitujemy prawdziwych wyciągów
+*.pdf
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+allegro_venv/
+
+# macOS
+.DS_Store
