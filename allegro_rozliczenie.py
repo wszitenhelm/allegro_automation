@@ -1,5 +1,5 @@
 """
-Allegro Finance — rozbicie przelewów bankowych na kupujących + walidacja.
+Allegro Finance - rozbicie przelewów bankowych na kupujących + walidacja.
 
 Użycie:
   python3 allegro_rozliczenie.py wyciag.pdf 2025-11
@@ -20,7 +20,8 @@ import sys
 import re
 import subprocess
 import calendar
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from collections import Counter
 from pathlib import Path
 from dotenv import load_dotenv
@@ -294,6 +295,18 @@ NAZWY_OPERATOROW = {
 def operator_z_op(op):
     return op.get("wallet", {}).get("paymentOperator", "UNKNOWN")
 
+WARSAW_TZ = ZoneInfo("Europe/Warsaw")
+
+def data_lokalna(occurred_at_iso):
+    """
+    occurredAt z API jest w UTC. Wyciąg mBank i panel Allegro pokazują czas
+    lokalny (Europe/Warsaw) — dla transakcji blisko północy surowa data UTC
+    i data lokalna mogą różnić się o 1 dzień. Porównujemy więc zawsze po
+    dacie lokalnej, a nie po surowym occurredAt[:10].
+    """
+    dt = datetime.fromisoformat(occurred_at_iso.replace("Z", "+00:00"))
+    return dt.astimezone(WARSAW_TZ).date()
+
 # zbierz unikalne operatory
 operatory = sorted(set(operator_z_op(o) for o in wszystkie_operacje))
 
@@ -305,9 +318,14 @@ for operator in operatory:
     wplaty    = [o for o in ops_op if o.get("group") == "INCOME"]
     zwroty_op = [o for o in ops_op if o.get("group") == "REFUND"]
 
-    # Wypłaty bankowe z miesiąca — dopasowane do wyciągu PO DACIE + KWOCIE.
+    # Wypłaty bankowe z miesiąca — dopasowane do wyciągu po KWOCIE i DACIE
+    # LOKALNEJ (patrz data_lokalna) z dodatkową tolerancją ±1 dzień na
+    # opóźnienie księgowania w banku (weekend/dzień roboczy).
     # WYCIAG_PRZELEWY jest dzielony (global, "uzyta" flaga) między operatorami,
-    # żeby ta sama para (data, kwota) nie została dopasowana dwa razy.
+    # żeby ta sama para (data, kwota) nie została dopasowana dwa razy. Gdy
+    # więcej niż jeden wpis z wyciągu pasuje kwotą w oknie ±1 dnia, wybierany
+    # jest ten z najmniejszą różnicą dni (najbliższy).
+    TOLERANCJA_DNI = 1
     wyplaty_all = sorted(
         [o for o in ops_op if o.get("type") == "PAYOUT" and o["occurredAt"] >= MIESIAC_OD],
         key=lambda x: x["occurredAt"]
@@ -315,14 +333,15 @@ for operator in operatory:
     wyplaty = []
     for o in wyplaty_all:
         kwota_abs = round(abs(float(o["value"]["amount"])), 2)
-        data_api  = o["occurredAt"][:10]
-        dopasowanie = next(
+        data_api  = data_lokalna(o["occurredAt"])
+        kandydaci = sorted(
             (w for w in WYCIAG_PRZELEWY
-             if not w["uzyta"] and w["data"] == data_api and w["kwota"] == kwota_abs),
-            None
+             if not w["uzyta"] and w["kwota"] == kwota_abs
+             and abs((date.fromisoformat(w["data"]) - data_api).days) <= TOLERANCJA_DNI),
+            key=lambda w: abs((date.fromisoformat(w["data"]) - data_api).days)
         )
-        if dopasowanie:
-            dopasowanie["uzyta"] = True
+        if kandydaci:
+            kandydaci[0]["uzyta"] = True
             wyplaty.append(o)
 
     if not wyplaty:
