@@ -3,6 +3,7 @@
 
 # dane wrażliwe klientów / wyciągi bankowe — nigdy nie commitujemy prawdziwych wyciągów
 *.pdf
+rozliczenie_*.csv
 
 # Python
 __pycache__/
