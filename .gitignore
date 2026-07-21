@@ -1,5 +1,6 @@
 # sekrety
 .env
+.streamlit/secrets.toml
 
 # dane wrażliwe klientów / wyciągi bankowe — nigdy nie commitujemy prawdziwych wyciągów
 *.pdf

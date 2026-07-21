@@ -6,22 +6,24 @@ import requests
 from config import BASE_URL, HEADERS
 
 
-def autoryzuj(nazwa_sklepu, client_id, client_secret):
-    """Device-code OAuth flow dla jednego sklepu/konta Allegro. Zwraca auth_headers."""
-    print(f"\n[{nazwa_sklepu}] Pobieram kod autoryzacji...")
+def zainicjuj_device_flow(client_id, client_secret):
+    """Krok 1 OAuth device flow: zwraca dict z 'verification_uri_complete', 'device_code', 'interval'."""
     r = requests.post(
         f"{BASE_URL}/auth/oauth/device",
         auth=(client_id, client_secret),
         data={"client_id": client_id},
     )
     r.raise_for_status()
-    device = r.json()
+    return r.json()
 
-    print(f">>> [{nazwa_sklepu}] Wejdź na: {device['verification_uri_complete']}")
-    print(">>> Zatwierdź dostęp w przeglądarce, a potem wróć tutaj i naciśnij Enter.")
-    input()
 
-    print(f"[{nazwa_sklepu}] Pobieram token...")
+def czekaj_na_token(client_id, client_secret, device, nazwa_sklepu="sklep"):
+    """
+    Krok 2 OAuth device flow: odpytuje o token dopóki użytkownik nie zatwierdzi
+    dostępu w przeglądarce (albo nie skończy się limit prób). Zwraca auth_headers.
+    Wspólne dla CLI (autoryzuj) i frontendu (app.py), które różnią się tylko tym,
+    jak proszą użytkownika o kliknięcie w link.
+    """
     interval = device.get("interval", 5)
     while True:
         r = requests.post(
@@ -34,12 +36,26 @@ def autoryzuj(nazwa_sklepu, client_id, client_secret):
         )
         data = r.json()
         if "access_token" in data:
-            print(f"[{nazwa_sklepu}] Token OK.\n")
             return {**HEADERS, "Authorization": f"Bearer {data['access_token']}"}
         if data.get("error") == "authorization_pending":
             time.sleep(interval)
         else:
             sys.exit(f"[{nazwa_sklepu}] Błąd autoryzacji: {data}")
+
+
+def autoryzuj(nazwa_sklepu, client_id, client_secret):
+    """Device-code OAuth flow dla jednego sklepu/konta Allegro (wersja CLI). Zwraca auth_headers."""
+    print(f"\n[{nazwa_sklepu}] Pobieram kod autoryzacji...")
+    device = zainicjuj_device_flow(client_id, client_secret)
+
+    print(f">>> [{nazwa_sklepu}] Wejdź na: {device['verification_uri_complete']}")
+    print(">>> Zatwierdź dostęp w przeglądarce, a potem wróć tutaj i naciśnij Enter.")
+    input()
+
+    print(f"[{nazwa_sklepu}] Pobieram token...")
+    auth_headers = czekaj_na_token(client_id, client_secret, device, nazwa_sklepu)
+    print(f"[{nazwa_sklepu}] Token OK.\n")
+    return auth_headers
 
 
 def pobierz_wszystkie(url, params, auth_headers):

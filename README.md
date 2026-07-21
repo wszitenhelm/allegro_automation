@@ -43,6 +43,38 @@ zbiorczych przelewów bankowych na kupujących, dla sklepów decor4-pl i pigmejk
   uruchamiania całego skryptu CLI (który dziś czeka na `input()` i sam
   odpala OAuth przy imporcie).
 
+- `app.py` — frontend (Streamlit) dla osoby nietechnicznej: wgraj wyciąg PDF,
+  wybierz rok/miesiąc, kliknij "Rozlicz". Loguje się przez link (bez
+  terminala) osobno do każdego skonfigurowanego sklepu, pokazuje tabelę
+  wyników (kolorowany status OK/ROZBIEZNOSC) i przycisk pobrania CSV.
+  Opcjonalnie chroniona hasłem (`APP_PASSWORD` w sekretach) — patrz niżej.
+
+## Frontend (Streamlit)
+
+Lokalnie:
+
+```bash
+pip install -r requirements.txt
+brew install poppler
+cp .env.example .env   # jak w sekcji Setup niżej
+streamlit run app.py
+```
+
+### Wdrożenie na Streamlit Community Cloud
+
+1. Repo jest już na GitHubie — nic więcej nie trzeba pushować.
+2. Wejdź na [share.streamlit.io](https://share.streamlit.io) → "New app" →
+   wybierz to repo, branch `main`, plik główny `app.py`.
+3. W ustawieniach aplikacji → "Secrets" wklej zawartość
+   `.streamlit/secrets.toml.example` uzupełnioną prawdziwymi danymi (Client
+   ID/Secret per sklep, opcjonalnie `ANTHROPIC_API_KEY`, i `APP_PASSWORD` —
+   proste hasło, żeby nikt obcy z linkiem nie odpalił rozliczenia na Waszym
+   koncie Allegro).
+4. `packages.txt` (poppler-utils) sprawia, że `pdftotext` jest dostępny na
+   serwerze Streamlit — nic dodatkowo nie trzeba instalować.
+5. Dostajesz publiczny link (`*.streamlit.app`). Każdy kolejny `git push` do
+   `main` automatycznie redeployuje aplikację.
+
 ## Setup
 
 ```bash
