@@ -31,7 +31,7 @@ load_dotenv()
 CLIENT_ID     = os.environ["ALLEGRO_CLIENT_ID"]
 CLIENT_SECRET = os.environ["ALLEGRO_CLIENT_SECRET"]
 LIMIT         = 100
-TOLERANCJA    = 0.01  # dopuszczalna różnica przy walidacji (grosze zaokrągleń)
+TOLERANCJA    = 0.00  # dopuszczalna różnica przy walidacji (grosze zaokrągleń)
 
 # ── PARSOWANIE PDF ────────────────────────────────────────────────────────────
 # Uwaga (decyzja projektowa): treść wyciągu bankowego (PDF) jest przetwarzana
@@ -212,7 +212,6 @@ def pobierz_wszystkie(url, params):
         offset += len(batch)
         if offset >= total or len(batch) == 0:
             break
-        print(f"  ...pobrano {offset}/{total}")
     return wyniki
 
 # ── KROK 3: wpłaty od kupujących (INCOME) ────────────────────────────────────
@@ -240,7 +239,7 @@ for op in ops:
     data_op  = op["occurredAt"][:10]
     pid      = op.get("payment", {}).get("id", "—")
     operator = op.get("wallet", {}).get("paymentOperator", "—")
-    print(f"{data_op} | {kwota:>8.2f} PLN | {operator:<8} | {pid} | {nazwa}")
+    #print(f"{data_op} | {kwota:>8.2f} PLN | {operator:<8} | {pid} | {nazwa}")
 
 print(f"\nŁącznie wpłat: {len(ops)}  |  Suma: {suma_wplat:.2f} PLN")
 
@@ -262,8 +261,8 @@ billing = pobierz_wszystkie(
 
 oplaty_pobrania = [b for b in billing if b["type"]["name"] == "Pobranie opłat z wpływów"]
 suma_oplat = sum(float(b["value"]["amount"]) for b in oplaty_pobrania)
-for b in oplaty_pobrania:
-    print(f"{b['occurredAt'][:10]} | {float(b['value']['amount']):>8.2f} PLN | Pobranie opłat z wpływów")
+#for b in oplaty_pobrania:
+    #print(f"{b['occurredAt'][:10]} | {float(b['value']['amount']):>8.2f} PLN | Pobranie opłat z wpływów")
 print(f"\nŁącznie pozycji: {len(oplaty_pobrania)}  |  Suma: {suma_oplat:.2f} PLN")
 
 # ── KROK 5: grupowanie wpłat wg wypłat + walidacja — per operator ────────────
@@ -464,7 +463,7 @@ for op in zwroty:
     data_op = op["occurredAt"][:10]
     pid     = op.get("payment", {}).get("id", "—")
     typ     = op.get("type", "—")
-    print(f"{data_op} | {kwota:>8.2f} PLN | {typ:<20} | {pid} | {nazwa}")
+    #print(f"{data_op} | {kwota:>8.2f} PLN | {typ:<20} | {pid} | {nazwa}")
 
 if not zwroty:
     print("Brak zwrotów w tym okresie.")
