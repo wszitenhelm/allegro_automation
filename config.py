@@ -7,12 +7,26 @@ from dotenv import load_dotenv
 load_dotenv()
 
 LIMIT          = 100
-TOLERANCJA     = 0.00  # dopuszczalna różnica przy walidacji (grosze zaokrągleń)
 TOLERANCJA_DNI = 1      # dopuszczalne przesunięcie daty (opóźnienie księgowe banku)
 
 BASE_URL = "https://allegro.pl"
 API_URL  = "https://api.allegro.pl"
 HEADERS  = {"Accept": "application/vnd.allegro.public.v1+json"}
+
+# Kolumny wyniku rozliczenia (CSV i frontend) — wspólne, żeby oba miejsca
+# eksportu pokazywały to samo.
+KOLUMNY_WYNIKU = ["sklep", "data", "operator", "kwota_przelewu",
+                  "l_kupujacych", "suma_zamowien", "oplaty", "zwroty"]
+NAZWY_KOLUMN_WYNIKU = {
+    "sklep": "Sklep",
+    "data": "Data",
+    "operator": "Operator",
+    "kwota_przelewu": "Kwota Przelewu",
+    "l_kupujacych": "Liczba kupujących",
+    "suma_zamowien": "Suma Zamówień",
+    "oplaty": "Pobranie opłat Allegro",
+    "zwroty": "Zwroty",
+}
 
 
 def _sklep_z_env(prefix, nazwa):

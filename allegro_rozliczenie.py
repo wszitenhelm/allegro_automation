@@ -1,5 +1,5 @@
 """
-Allegro Finance - rozbicie przelewów bankowych na kupujących + walidacja.
+Allegro Finance - rozbicie przelewów bankowych na kupujących.
 Obsługuje wiele sklepów (kont Allegro) rozliczanych z tego samego wyciągu.
 
 Użycie:
@@ -28,10 +28,10 @@ import csv
 import re
 import sys
 
-from config import wczytaj_sklepy, zakres_dat
+from config import wczytaj_sklepy, zakres_dat, KOLUMNY_WYNIKU, NAZWY_KOLUMN_WYNIKU
 from pdf_parser import parsuj_pdf_mbank
 from allegro_api import autoryzuj
-from rozliczenie import rozlicz_sklep, operator_z_op
+from rozliczenie import rozlicz_sklep
 from llm_summary import generuj_podsumowanie_llm
 
 
@@ -67,51 +67,16 @@ def main():
     date_od, date_do, miesiac_od, wyciag_przelewy = ustal_parametry()
 
     wiersze_csv = []
-    stats_wszystkie = {}              # (sklep, operator) -> stats
-    operacje_wszystkich_sklepow = []  # do diagnostyki sierot niżej
+    stats_wszystkie = {}  # (sklep, operator) -> stats
 
     for sklep in sklepy:
         auth_headers = autoryzuj(sklep["nazwa"], sklep["client_id"], sklep["client_secret"])
-        wiersze, stats, operacje_sklepu = rozlicz_sklep(
+        wiersze, stats, _ = rozlicz_sklep(
             sklep["nazwa"], auth_headers, date_od, date_do, miesiac_od, wyciag_przelewy
         )
         wiersze_csv.extend(wiersze)
         for operator, dane in stats.items():
             stats_wszystkie[(sklep["nazwa"], operator)] = dane
-        operacje_wszystkich_sklepow.extend(
-            [{**o, "_sklep": sklep["nazwa"]} for o in operacje_sklepu]
-        )
-
-    # kwoty z wyciągu bez odpowiadającej wypłaty w ŻADNYM ze sklepów
-    sieroty = [w for w in wyciag_przelewy if not w["uzyta"]]
-    if sieroty:
-        print("\n" + "=" * 60)
-        print("UWAGA: kwoty z wyciągu BEZ odpowiadającej wypłaty w żadnym sklepie")
-        print("=" * 60)
-        for w in sieroty:
-            print(f"  {w['data']} | {w['kwota']:>8.2f} PLN  — sprawdź ręcznie")
-            # diagnostyka: pokaż zbliżone PAYOUT-y z API (kwota w promieniu
-            # 1 PLN, w dowolnym ze sklepów), żeby zobaczyć czy to np.
-            # przesunięcie daty a nie brak wypłaty w ogóle.
-            kandydaci = [
-                o for o in operacje_wszystkich_sklepow
-                if o.get("type") == "PAYOUT"
-                and abs(round(abs(float(o["value"]["amount"])), 2) - w["kwota"]) < 1.0
-            ]
-            for k in kandydaci:
-                kw_ = round(abs(float(k["value"]["amount"])), 2)
-                print(f"      [diagnostyka] zbliżony PAYOUT w API: {k['occurredAt']} "
-                      f"| {kw_:.2f} PLN | operator={operator_z_op(k)} | sklep={k['_sklep']}")
-            wiersze_csv.append({
-                "sklep": "NIEZNANY",
-                "data": w["data"],
-                "operator": "NIEZNANY",
-                "kwota_przelewu": f"{w['kwota']:.2f}",
-                "l_kupujacych": "",
-                "oplaty": "",
-                "zwroty": "",
-                "status": "ROZBIEZNOSC (brak w API)",
-            })
 
     # eksport CSV
     print("\n" + "=" * 60)
@@ -120,11 +85,8 @@ def main():
 
     plik_csv = f"rozliczenie_{miesiac_od[:7]}.csv"
     with open(plik_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f, fieldnames=["sklep", "data", "operator", "kwota_przelewu",
-                           "l_kupujacych", "oplaty", "zwroty", "status"]
-        )
-        writer.writeheader()
+        csv.writer(f).writerow([NAZWY_KOLUMN_WYNIKU[k] for k in KOLUMNY_WYNIKU])
+        writer = csv.DictWriter(f, fieldnames=KOLUMNY_WYNIKU, extrasaction="ignore")
         writer.writerows(wiersze_csv)
     print(f"Zapisano: {plik_csv}  ({len(wiersze_csv)} wierszy)")
 
@@ -133,12 +95,6 @@ def main():
         {"sklep": sklep, "operator": operator, **dane}
         for (sklep, operator), dane in stats_wszystkie.items()
     ]
-    if sieroty:
-        stats_dla_llm.append({
-            "sklep": "NIEZNANY", "operator": "NIEZNANY (brak w API)",
-            "ok": 0, "rozbieznosci": len(sieroty), "suma": 0.0,
-            "suma_rozbieznosci": round(sum(w["kwota"] for w in sieroty), 2),
-        })
 
     podsumowanie = generuj_podsumowanie_llm(stats_dla_llm)
     if podsumowanie:

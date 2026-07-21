@@ -25,11 +25,11 @@ try:
 except FileNotFoundError:
     pass
 
-from allegro_api import zainicjuj_device_flow, czekaj_na_token, pobierz_wszystkie
-from config import wczytaj_sklepy, zakres_dat
+from allegro_api import zainicjuj_device_flow, czekaj_na_token
+from config import wczytaj_sklepy, zakres_dat, KOLUMNY_WYNIKU, NAZWY_KOLUMN_WYNIKU
 from llm_summary import generuj_podsumowanie_llm
 from pdf_parser import parsuj_pdf_mbank
-from rozliczenie import operator_z_op, rozlicz_sklep
+from rozliczenie import rozlicz_sklep
 
 MIESIACE = [
     "styczeń", "luty", "marzec", "kwiecień", "maj", "czerwiec",
@@ -39,7 +39,7 @@ MIESIACE = [
 st.set_page_config(
     page_title="Rozliczenia Allegro Finance",
     page_icon="logo.png" if Path("logo.png").exists() else "📊",
-    layout="centered",
+    layout="wide",
 )
 
 
@@ -74,18 +74,16 @@ st.markdown("#### mniej czasu na księgowanie = więcej czasu z rodziną")
 
 st.divider()
 
-sklepy = wczytaj_sklepy()
-if not sklepy:
+sklepy_wszystkie = wczytaj_sklepy()
+if not sklepy_wszystkie:
     st.error(
         "Brak skonfigurowanych sklepów. Ustaw w Secrets co najmniej "
         "`ALLEGRO_PIGMEJKA_CLIENT_ID` / `ALLEGRO_PIGMEJKA_CLIENT_SECRET`."
     )
     st.stop()
 
-st.caption(f"Skonfigurowane sklepy: {', '.join(s['nazwa'] for s in sklepy)}")
 
-
-# ── formularz: wyciąg + miesiąc ───────────────────────────────────────────────
+# ── formularz: wyciąg + miesiąc + sklepy ─────────────────────────────────────
 plik = st.file_uploader("Wgraj wyciąg bankowy (PDF)", type="pdf")
 
 col_rok, col_miesiac = st.columns(2)
@@ -93,7 +91,22 @@ rok = col_rok.number_input("Rok", min_value=2020, max_value=2100, value=2025, st
 miesiac_nazwa = col_miesiac.selectbox("Miesiąc", MIESIACE, index=10)
 miesiac = MIESIACE.index(miesiac_nazwa) + 1
 
-rozlicz_kliknieto = st.button("Rozlicz", type="primary", disabled=plik is None)
+nazwy_wybrane = st.multiselect(
+    "Które sklepy rozliczyć?",
+    options=[s["nazwa"] for s in sklepy_wszystkie],
+    default=[s["nazwa"] for s in sklepy_wszystkie],
+)
+sklepy = [s for s in sklepy_wszystkie if s["nazwa"] in nazwy_wybrane]
+
+if sklepy and len(sklepy) < len(sklepy_wszystkie):
+    st.info(
+        "Rozliczasz tylko wybrane sklepy z tego wyciągu. Przelewy należące do "
+        "pominiętych sklepów (" + ", ".join(
+            s["nazwa"] for s in sklepy_wszystkie if s["nazwa"] not in nazwy_wybrane
+        ) + ") po prostu nie pojawią się w wyniku, bo nie są sprawdzane."
+    )
+
+rozlicz_kliknieto = st.button("Rozlicz", type="primary", disabled=plik is None or not sklepy)
 
 
 def autoryzuj_w_appce(nazwa_sklepu, client_id, client_secret, status):
@@ -109,10 +122,6 @@ def autoryzuj_w_appce(nazwa_sklepu, client_id, client_secret, status):
     )
     with st.spinner(f"Czekam na zatwierdzenie dostępu dla {nazwa_sklepu}..."):
         return czekaj_na_token(client_id, client_secret, device, nazwa_sklepu)
-
-
-def kolor_statusu(status):
-    return "background-color: #ffe0cc" if "ROZBIEZNOSC" in status else "background-color: #e6f4ea"
 
 
 if rozlicz_kliknieto and plik is not None:
@@ -135,7 +144,6 @@ if rozlicz_kliknieto and plik is not None:
 
             wiersze_csv = []
             stats_wszystkie = {}
-            operacje_wszystkich_sklepow = []
 
             for sklep in sklepy:
                 status.write(f"Logowanie do **{sklep['nazwa']}**...")
@@ -143,35 +151,18 @@ if rozlicz_kliknieto and plik is not None:
                     sklep["nazwa"], sklep["client_id"], sklep["client_secret"], status
                 )
                 status.write(f"Pobieram i dopasowuję dane dla **{sklep['nazwa']}**...")
-                wiersze, stats, operacje_sklepu = rozlicz_sklep(
+                wiersze, stats, _ = rozlicz_sklep(
                     sklep["nazwa"], auth_headers, date_od, date_do, miesiac_od, wyciag_przelewy
                 )
                 wiersze_csv.extend(wiersze)
                 for operator, dane in stats.items():
                     stats_wszystkie[(sklep["nazwa"], operator)] = dane
-                operacje_wszystkich_sklepow.extend(
-                    [{**o, "_sklep": sklep["nazwa"]} for o in operacje_sklepu]
-                )
                 status.write(f"✅ {sklep['nazwa']} gotowe.")
-
-            sieroty = [w for w in wyciag_przelewy if not w["uzyta"]]
-            for w in sieroty:
-                wiersze_csv.append({
-                    "sklep": "NIEZNANY",
-                    "data": w["data"],
-                    "operator": "NIEZNANY",
-                    "kwota_przelewu": f"{w['kwota']:.2f}",
-                    "l_kupujacych": "",
-                    "oplaty": "",
-                    "zwroty": "",
-                    "status": "ROZBIEZNOSC (brak w API)",
-                })
 
             status.update(label="Gotowe!", state="complete")
 
         st.session_state["wyniki"] = {
             "wiersze_csv": wiersze_csv,
-            "sieroty": sieroty,
             "stats_wszystkie": stats_wszystkie,
             "miesiac_od": miesiac_od,
         }
@@ -183,25 +174,44 @@ if rozlicz_kliknieto and plik is not None:
 if "wyniki" in st.session_state:
     wyniki = st.session_state["wyniki"]
     wiersze_csv = wyniki["wiersze_csv"]
-    sieroty = wyniki["sieroty"]
 
     st.divider()
     st.subheader("Wynik rozliczenia")
 
-    if sieroty:
-        st.warning(
-            f"{len(sieroty)} kwot(y) z wyciągu nie mają odpowiadającej wypłaty "
-            f"w żadnym sklepie — sprawdź je ręcznie (oznaczone poniżej)."
-        )
+    df_widok = pd.DataFrame(wiersze_csv)[KOLUMNY_WYNIKU].rename(columns=NAZWY_KOLUMN_WYNIKU)
 
-    df = pd.DataFrame(wiersze_csv)
-    st.dataframe(
-        df.style.map(kolor_statusu, subset=["status"]),
+    st.caption("Kliknij w wiersz, żeby zobaczyć listę kupujących i zwrotów dla tego przelewu.")
+    zdarzenie = st.dataframe(
+        df_widok,
         use_container_width=True,
         hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
     )
 
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    wybrane = zdarzenie.selection.rows if zdarzenie and zdarzenie.selection else []
+    if wybrane:
+        wiersz = wiersze_csv[wybrane[0]]
+        st.markdown(
+            f"**Szczegóły: {wiersz['data']} | {wiersz['kwota_przelewu']} PLN | {wiersz['sklep']}**"
+        )
+        col_kupujacy, col_zwroty = st.columns(2)
+        with col_kupujacy:
+            st.markdown("**Kupujący**")
+            lista = wiersz.get("kupujacy_lista") or []
+            if lista:
+                st.dataframe(pd.DataFrame(lista), hide_index=True, use_container_width=True)
+            else:
+                st.caption("Brak kupujących w tym oknie.")
+        with col_zwroty:
+            st.markdown("**Zwroty**")
+            lista = wiersz.get("zwroty_lista") or []
+            if lista:
+                st.dataframe(pd.DataFrame(lista), hide_index=True, use_container_width=True)
+            else:
+                st.caption("Brak zwrotów w tym oknie.")
+
+    csv_bytes = df_widok.to_csv(index=False).encode("utf-8")
     st.download_button(
         "⬇️ Pobierz CSV (do księgowej)",
         data=csv_bytes,
@@ -213,12 +223,6 @@ if "wyniki" in st.session_state:
         {"sklep": sklep, "operator": operator, **dane}
         for (sklep, operator), dane in wyniki["stats_wszystkie"].items()
     ]
-    if sieroty:
-        stats_dla_llm.append({
-            "sklep": "NIEZNANY", "operator": "NIEZNANY (brak w API)",
-            "ok": 0, "rozbieznosci": len(sieroty), "suma": 0.0,
-            "suma_rozbieznosci": round(sum(w["kwota"] for w in sieroty), 2),
-        })
     podsumowanie = generuj_podsumowanie_llm(stats_dla_llm)
     if podsumowanie:
         st.info(podsumowanie)

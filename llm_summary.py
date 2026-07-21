@@ -4,7 +4,7 @@ Opcjonalne podsumowanie tekstowe rozliczenia (Anthropic API).
 Dostaje WYŁĄCZNIE zagregowane liczby per sklep/operator — nigdy treść
 wyciągu ani dane osobowe kupujących (patrz pdf_parser.py). Zwraca None
 (i drukuje powód) jeśli brak klucza API/pakietu, żeby reszta programu
-(CSV, walidacja) działała niezależnie od tego kroku.
+(CSV) działała niezależnie od tego kroku.
 """
 import os
 import json
@@ -25,10 +25,11 @@ def generuj_podsumowanie_llm(stats):
     prompt = (
         "Jesteś asystentem księgowej sklepów e-commerce. Poniżej masz WYŁĄCZNIE "
         "zagregowane liczby (bez danych osobowych, bez numerów kont) z "
-        "miesięcznego rozliczenia Allegro Finance, per sklep i operator płatności. "
-        "Napisz 2-3 zdania podsumowania po polsku: ile przelewów się zgadza, "
-        "ile ma rozbieżności i na jaką łączną kwotę, czy coś wymaga uwagi "
-        "księgowej przed zaksięgowaniem.\n\n"
+        "miesięcznego rozliczenia Allegro Finance, per sklep i operator płatności: "
+        "liczba przelewów bankowych, suma przelewów, suma zamówień kupujących, "
+        "suma pobranych opłat Allegro, suma zwrotów. Napisz 2-3 zdania "
+        "podsumowania po polsku dla księgowej — ile przelewów, na jakie kwoty, "
+        "jakie opłaty i zwroty w danym miesiącu.\n\n"
         f"{json.dumps(stats, ensure_ascii=False, indent=2)}"
     )
     try:

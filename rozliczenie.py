@@ -3,7 +3,7 @@ from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 from allegro_api import pobierz_wszystkie
-from config import API_URL, LIMIT, TOLERANCJA, TOLERANCJA_DNI
+from config import API_URL, LIMIT, TOLERANCJA_DNI
 
 WARSAW_TZ = ZoneInfo("Europe/Warsaw")
 
@@ -30,6 +30,19 @@ def operator_z_op(op):
     return op.get("wallet", {}).get("paymentOperator", "UNKNOWN")
 
 
+def _nazwa_uczestnika(op):
+    p = op.get("participant", {})
+    return p.get("companyName") or f"{p.get('firstName','')} {p.get('lastName','')}".strip()
+
+
+def _jako_lista(operacje):
+    """Zamienia listę operacji (kupujący/zwroty) na proste dicty do wyświetlenia w UI."""
+    return [
+        {"data": o["occurredAt"][:10], "kwota": float(o["value"]["amount"]), "nazwa": _nazwa_uczestnika(o)}
+        for o in operacje
+    ]
+
+
 def rozlicz_sklep(nazwa_sklepu, auth_headers, date_od, date_do, miesiac_od, wyciag_przelewy):
     """
     Pobiera dane jednego sklepu/konta Allegro i dopasowuje jego wypłaty do
@@ -38,15 +51,14 @@ def rozlicz_sklep(nazwa_sklepu, auth_headers, date_od, date_do, miesiac_od, wyci
     jednego sklepu/operatora — mutowana w miejscu przez wywołującego dla
     kolejnych sklepów).
 
-    Zwraca (wiersze_csv, stats_operator, wszystkie_operacje) dla tego sklepu —
-    wszystkie_operacje jest potrzebne później do diagnostyki sierot.
+    Zwraca (wiersze_csv, stats_operator, wszystkie_operacje) dla tego sklepu.
     """
     print("\n" + "#" * 60)
     print(f"# SKLEP: {nazwa_sklepu}")
     print("#" * 60)
 
     print("\n" + "=" * 60)
-    print("ROZBICIE PRZELEWÓW BANKOWYCH NA KUPUJĄCYCH (per operator) + WALIDACJA")
+    print("ROZBICIE PRZELEWÓW BANKOWYCH NA KUPUJĄCYCH (per operator)")
     print("=" * 60)
     # jedno pobranie bez filtra 'group' wystarcza na wpłaty (INCOME), zwroty
     # (REFUND) i wypłaty (PAYOUT) — filtrujemy lokalnie zamiast pobierać te
@@ -61,17 +73,6 @@ def rozlicz_sklep(nazwa_sklepu, auth_headers, date_od, date_do, miesiac_od, wyci
     suma_wplat = sum(float(o["value"]["amount"]) for o in wszystkie_operacje if o.get("group") == "INCOME")
     print(f"Wpłaty od kupujących {date_od[:10]} – {date_do[:10]}: "
           f"{sum(1 for o in wszystkie_operacje if o.get('group') == 'INCOME')}  |  Suma: {suma_wplat:.2f} PLN")
-
-    # opłaty Allegro (prowizje z wpływów) — RZECZYWISTA prowizja, potrzebna
-    # do walidacji per przelew niżej, nie wyliczana jako dopełnienie.
-    billing = pobierz_wszystkie(
-        f"{API_URL}/billing/billing-entries",
-        {"limit": LIMIT, "occurredAt.gte": date_od, "occurredAt.lte": date_do},
-        auth_headers,
-    )
-    oplaty_pobrania = [b for b in billing if b["type"]["name"] == "Pobranie opłat z wpływów"]
-    suma_oplat = sum(float(b["value"]["amount"]) for b in oplaty_pobrania)
-    print(f"Opłaty Allegro (prowizje): {len(oplaty_pobrania)}  |  Suma: {suma_oplat:.2f} PLN")
 
     operatory = sorted(set(operator_z_op(o) for o in wszystkie_operacje))
 
@@ -122,7 +123,8 @@ def rozlicz_sklep(nazwa_sklepu, auth_headers, date_od, date_do, miesiac_od, wyci
         prev_time = wyplaty_przed[-1]["occurredAt"] if wyplaty_przed else date_od
 
         stats_operator_sklepu.setdefault(operator, {
-            "ok": 0, "rozbieznosci": 0, "suma": 0.0, "suma_rozbieznosci": 0.0,
+            "liczba_przelewow": 0, "suma_przelewow": 0.0,
+            "suma_zamowien": 0.0, "suma_oplat": 0.0, "suma_zwrotow": 0.0,
         })
 
         for wyplata in wyplaty:
@@ -131,38 +133,49 @@ def rozlicz_sklep(nazwa_sklepu, auth_headers, date_od, date_do, miesiac_od, wyci
 
             kupujacy    = [o for o in wplaty if prev_time < o["occurredAt"] <= czas_wyplaty]
             zwroty_okna = [o for o in zwroty_op if prev_time < o["occurredAt"] <= czas_wyplaty]
-            oplaty_okna = [b for b in oplaty_pobrania if prev_time < b["occurredAt"] <= czas_wyplaty]
 
-            data_wyplaty       = czas_wyplaty[:10]
-            suma_kupujacych    = sum(float(o["value"]["amount"]) for o in kupujacy)
-            suma_zwrotow_abs   = sum(abs(float(o["value"]["amount"])) for o in zwroty_okna)
-            oplaty_rzeczywiste = sum(abs(float(b["value"]["amount"])) for b in oplaty_okna)
-
-            # Walidacja: suma wpłat − suma zwrotów − suma prowizji Allegro = kwota przelewu
-            roznica = round(suma_kupujacych - suma_zwrotow_abs - oplaty_rzeczywiste - kwota_wyplaty_abs, 2)
-            status  = "OK" if abs(roznica) <= TOLERANCJA else f"ROZBIEZNOSC ({roznica:+.2f} PLN)"
+            data_wyplaty     = czas_wyplaty[:10]
+            suma_kupujacych  = sum(float(o["value"]["amount"]) for o in kupujacy)
+            suma_zwrotow_abs = sum(abs(float(o["value"]["amount"])) for o in zwroty_okna)
+            # Pobranie opłat Allegro liczone jako reszta z równania (nie z
+            # osobnego zapytania do billing-entries): rzeczywiste opłaty
+            # Allegro (prowizja + dostawa itd.) są rozliczane z opóźnieniem,
+            # które nie pokrywa się z oknem między przelewami, więc nie da
+            # się ich wiarygodnie dopasować per przelew. Wzór:
+            #   Σ zamówień − kwota przelewu − zwroty = Pobranie opłat Allegro
+            oplaty_rzeczywiste = round(suma_kupujacych - kwota_wyplaty_abs - suma_zwrotow_abs, 2)
 
             print(f"\n  PRZELEW: {data_wyplaty} | {kwota_wyplaty_abs:.2f} PLN  "
-                  f"[Σ kupujących: {suma_kupujacych:.2f} - prowizja: {oplaty_rzeczywiste:.2f} "
-                  f"- zwroty: {suma_zwrotow_abs:.2f}]  [{status}]")
+                  f"[Σ zamówień: {suma_kupujacych:.2f} - pobranie opłat Allegro: "
+                  f"{oplaty_rzeczywiste:.2f} - zwroty: {suma_zwrotow_abs:.2f}]")
+            for o in kupujacy:
+                print(f"    wpłata: {o['occurredAt']} | {float(o['value']['amount']):>8.2f} PLN | "
+                      f"{_nazwa_uczestnika(o)}")
+            for o in zwroty_okna:
+                print(f"    zwrot:  {o['occurredAt']} | {float(o['value']['amount']):>8.2f} PLN | "
+                      f"{_nazwa_uczestnika(o)}")
 
             wiersze_csv_sklepu.append({
                 "sklep": nazwa_sklepu,
                 "data": data_wyplaty,
                 "operator": operator,
                 "kwota_przelewu": f"{kwota_wyplaty_abs:.2f}",
-                "l_kupujacych": len(kupujacy),
+                "l_kupujacych": str(len(kupujacy)),
+                "suma_zamowien": f"{suma_kupujacych:.2f}",
                 "oplaty": f"{oplaty_rzeczywiste:.2f}",
                 "zwroty": f"{suma_zwrotow_abs:.2f}",
-                "status": status,
+                # nie trafiają do CSV (csv.DictWriter pisze tylko zdefiniowane
+                # fieldnames) — używane przez frontend do pokazania szczegółów
+                # po kliknięciu w wiersz
+                "kupujacy_lista": _jako_lista(kupujacy),
+                "zwroty_lista": _jako_lista(zwroty_okna),
             })
             st = stats_operator_sklepu[operator]
-            st["suma"] += kwota_wyplaty_abs
-            if status == "OK":
-                st["ok"] += 1
-            else:
-                st["rozbieznosci"] += 1
-                st["suma_rozbieznosci"] += abs(roznica)
+            st["liczba_przelewow"] += 1
+            st["suma_przelewow"] += kwota_wyplaty_abs
+            st["suma_zamowien"] += suma_kupujacych
+            st["suma_oplat"] += oplaty_rzeczywiste
+            st["suma_zwrotow"] += suma_zwrotow_abs
 
             prev_time = czas_wyplaty
 
