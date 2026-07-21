@@ -1,5 +1,6 @@
 """
 Allegro Finance - rozbicie przelewów bankowych na kupujących + walidacja.
+Obsługuje wiele sklepów (kont Allegro) rozliczanych z tego samego wyciągu.
 
 Użycie:
   python3 allegro_rozliczenie.py wyciag.pdf 2025-11
@@ -7,6 +8,14 @@ Użycie:
 Wymagania:
   pip install -r requirements.txt
   brew install poppler   (dla pdftotext)
+
+Sklepy do rozliczenia konfiguruje się w .env (patrz .env.example):
+  ALLEGRO_PIGMEJKA_CLIENT_ID / ALLEGRO_PIGMEJKA_CLIENT_SECRET
+  ALLEGRO_DECOR_CLIENT_ID / ALLEGRO_DECOR_CLIENT_SECRET
+Skrypt loguje się (OAuth) osobno do każdego skonfigurowanego sklepu i
+dopasowuje jego wypłaty do tej samej wspólnej puli przelewów z wyciągu —
+jeden wpis z wyciągu może zostać przypisany tylko do jednego sklepu.
+Sklep bez ustawionych zmiennych w .env jest po prostu pomijany.
 
 Opcjonalnie (podsumowanie tekstowe): ustaw ANTHROPIC_API_KEY w .env.
 Bez tego skrypt działa normalnie, tylko pomija ten krok.
@@ -22,23 +31,41 @@ import subprocess
 import calendar
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
-from collections import Counter
-from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
 
-CLIENT_ID     = os.environ["ALLEGRO_CLIENT_ID"]
-CLIENT_SECRET = os.environ["ALLEGRO_CLIENT_SECRET"]
-LIMIT         = 100
-TOLERANCJA    = 0.00  # dopuszczalna różnica przy walidacji (grosze zaokrągleń)
+
+def _sklep_z_env(prefix, nazwa):
+    client_id = os.environ.get(f"ALLEGRO_{prefix}_CLIENT_ID")
+    client_secret = os.environ.get(f"ALLEGRO_{prefix}_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        return None
+    return {"nazwa": nazwa, "client_id": client_id, "client_secret": client_secret}
+
+
+SKLEPY = [s for s in [
+    _sklep_z_env("PIGMEJKA", "pigmejka-pl"),
+    _sklep_z_env("DECOR", "decor4-pl"),
+] if s is not None]
+
+if not SKLEPY:
+    sys.exit(
+        "Brak skonfigurowanych sklepów w .env. Ustaw co najmniej:\n"
+        "  ALLEGRO_PIGMEJKA_CLIENT_ID / ALLEGRO_PIGMEJKA_CLIENT_SECRET\n"
+        "(opcjonalnie też ALLEGRO_DECOR_CLIENT_ID / ALLEGRO_DECOR_CLIENT_SECRET)"
+    )
+
+LIMIT          = 100
+TOLERANCJA     = 0.00  # dopuszczalna różnica przy walidacji (grosze zaokrągleń)
+TOLERANCJA_DNI = 1      # dopuszczalne przesunięcie daty (opóźnienie księgowe banku)
 
 # ── PARSOWANIE PDF ────────────────────────────────────────────────────────────
 # Uwaga (decyzja projektowa): treść wyciągu bankowego (PDF) jest przetwarzana
 # wyłącznie lokalnie (pdftotext + regex) i nigdy nie jest wysyłana do żadnego
 # zewnętrznego LLM/API. Wyciąg zawiera dane wrażliwe (IBAN, kontrahenci spoza
 # Allegro). Jedyne dane trafiające do LLM (patrz generuj_podsumowanie_llm) to
-# już zagregowane liczby per operator (ile przelewów, jakie sumy) — nigdy
+# już zagregowane liczby per sklep/operator (ile przelewów, jakie sumy) — nigdy
 # surowy tekst wyciągu ani dane osobowe kupujących (imię/nazwisko z Allegro API).
 
 UUID_RE  = re.compile(
@@ -72,8 +99,9 @@ def parsuj_pdf_mbank(sciezka):
     W mBank layout kwota przelewu jest zawsze przed saldem bieżącym.
 
     Data jest potrzebna do dopasowania: ta sama kwota może wystąpić kilka razy
-    w wyciągu w różnych dniach (różne operatory/wypłaty), więc samo liczenie
-    wystąpień kwoty (bez daty) nie wystarcza do jednoznacznego dopasowania.
+    w wyciągu w różnych dniach (różne operatory/wypłaty/sklepy), więc samo
+    liczenie wystąpień kwoty (bez daty) nie wystarcza do jednoznacznego
+    dopasowania.
     """
     proc = subprocess.run(
         ["pdftotext", "-layout", str(sciezka), "-"],
@@ -154,46 +182,68 @@ BASE_URL = "https://allegro.pl"
 API_URL  = "https://api.allegro.pl"
 HEADERS  = {"Accept": "application/vnd.allegro.public.v1+json"}
 
-# ── KROK 1: pobierz device code ──────────────────────────────────────────────
-print("Pobieram kod autoryzacji...")
-r = requests.post(
-    f"{BASE_URL}/auth/oauth/device",
-    auth=(CLIENT_ID, CLIENT_SECRET),
-    data={"client_id": CLIENT_ID},
-)
-r.raise_for_status()
-device = r.json()
+WARSAW_TZ = ZoneInfo("Europe/Warsaw")
 
-print(f"\n>>> Wejdź na: {device['verification_uri_complete']}")
-print(">>> Zatwierdź dostęp w przeglądarce, a potem wróć tutaj i naciśnij Enter.")
-input()
+NAZWY_OPERATOROW = {
+    "AF":       "Allegro Finance (bezpośredni)",
+    "AF_PAYU":  "Allegro Finance — PayU",
+    "AF_P24":   "Allegro Finance — Przelewy24 (PayPro)",
+    "PAYPRO":   "Allegro Finance — Przelewy24 (PayPro)",
+}
 
-# ── KROK 2: odbierz token ─────────────────────────────────────────────────────
-print("Pobieram token...")
-interval = device.get("interval", 5)
-while True:
+
+def data_lokalna(occurred_at_iso):
+    """
+    occurredAt z API jest w UTC. Wyciąg mBank i panel Allegro pokazują czas
+    lokalny (Europe/Warsaw) — dla transakcji blisko północy surowa data UTC
+    i data lokalna mogą różnić się o 1 dzień. Porównujemy więc zawsze po
+    dacie lokalnej, a nie po surowym occurredAt[:10].
+    """
+    dt = datetime.fromisoformat(occurred_at_iso.replace("Z", "+00:00"))
+    return dt.astimezone(WARSAW_TZ).date()
+
+
+def operator_z_op(op):
+    return op.get("wallet", {}).get("paymentOperator", "UNKNOWN")
+
+
+def autoryzuj(nazwa_sklepu, client_id, client_secret):
+    """Device-code OAuth flow dla jednego sklepu/konta Allegro. Zwraca auth_headers."""
+    print(f"\n[{nazwa_sklepu}] Pobieram kod autoryzacji...")
     r = requests.post(
-        f"{BASE_URL}/auth/oauth/token",
-        auth=(CLIENT_ID, CLIENT_SECRET),
-        data={
-            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-            "device_code": device["device_code"],
-        },
+        f"{BASE_URL}/auth/oauth/device",
+        auth=(client_id, client_secret),
+        data={"client_id": client_id},
     )
-    data = r.json()
-    if "access_token" in data:
-        token = data["access_token"]
-        print("Token OK.\n")
-        break
-    if data.get("error") == "authorization_pending":
-        time.sleep(interval)
-    else:
-        print("Błąd:", data)
-        exit(1)
+    r.raise_for_status()
+    device = r.json()
 
-auth_headers = {**HEADERS, "Authorization": f"Bearer {token}"}
+    print(f">>> [{nazwa_sklepu}] Wejdź na: {device['verification_uri_complete']}")
+    print(">>> Zatwierdź dostęp w przeglądarce, a potem wróć tutaj i naciśnij Enter.")
+    input()
 
-def pobierz_wszystkie(url, params):
+    print(f"[{nazwa_sklepu}] Pobieram token...")
+    interval = device.get("interval", 5)
+    while True:
+        r = requests.post(
+            f"{BASE_URL}/auth/oauth/token",
+            auth=(client_id, client_secret),
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device["device_code"],
+            },
+        )
+        data = r.json()
+        if "access_token" in data:
+            print(f"[{nazwa_sklepu}] Token OK.\n")
+            return {**HEADERS, "Authorization": f"Bearer {data['access_token']}"}
+        if data.get("error") == "authorization_pending":
+            time.sleep(interval)
+        else:
+            sys.exit(f"[{nazwa_sklepu}] Błąd autoryzacji: {data}")
+
+
+def pobierz_wszystkie(url, params, auth_headers):
     """Pobiera wszystkie strony wyników (paginacja)."""
     wyniki = []
     offset = 0
@@ -214,271 +264,173 @@ def pobierz_wszystkie(url, params):
             break
     return wyniki
 
-# ── KROK 3: wpłaty od kupujących (INCOME) ────────────────────────────────────
-print("=" * 60)
-print(f"WPŁATY OD KUPUJĄCYCH  {DATE_OD[:10]} – {DATE_DO[:10]}")
-print("=" * 60)
 
-ops = pobierz_wszystkie(
-    f"{API_URL}/payments/payment-operations",
-    {
-        "group": "INCOME",
-        "limit": LIMIT,
-        "occurredAt.gte": DATE_OD,
-        "occurredAt.lte": DATE_DO,
-        "currency": "PLN",
-    },
-)
-
-suma_wplat = 0.0
-for op in ops:
-    p = op.get("participant", {})
-    nazwa = p.get("companyName") or f"{p.get('firstName','')} {p.get('lastName','')}".strip()
-    kwota = float(op["value"]["amount"])
-    suma_wplat += kwota
-    data_op  = op["occurredAt"][:10]
-    pid      = op.get("payment", {}).get("id", "—")
-    operator = op.get("wallet", {}).get("paymentOperator", "—")
-    #print(f"{data_op} | {kwota:>8.2f} PLN | {operator:<8} | {pid} | {nazwa}")
-
-print(f"\nŁącznie wpłat: {len(ops)}  |  Suma: {suma_wplat:.2f} PLN")
-
-# ── KROK 4: opłaty Allegro (prowizje z wpływów) ───────────────────────────────
-# Pobrane PRZED rozbiciem na operatorów, bo są potrzebne do walidacji per przelew
-# (patrz KROK 5): to jest RZECZYWISTA prowizja, nie wyliczana jako dopełnienie.
-print("\n" + "=" * 60)
-print(f"OPŁATY ALLEGRO (prowizje z wpływów)  {DATE_OD[:10]} – {DATE_DO[:10]}")
-print("=" * 60)
-
-billing = pobierz_wszystkie(
-    f"{API_URL}/billing/billing-entries",
-    {
-        "limit": LIMIT,
-        "occurredAt.gte": DATE_OD,
-        "occurredAt.lte": DATE_DO,
-    },
-)
-
-oplaty_pobrania = [b for b in billing if b["type"]["name"] == "Pobranie opłat z wpływów"]
-suma_oplat = sum(float(b["value"]["amount"]) for b in oplaty_pobrania)
-#for b in oplaty_pobrania:
-    #print(f"{b['occurredAt'][:10]} | {float(b['value']['amount']):>8.2f} PLN | Pobranie opłat z wpływów")
-print(f"\nŁącznie pozycji: {len(oplaty_pobrania)}  |  Suma: {suma_oplat:.2f} PLN")
-
-# ── KROK 5: grupowanie wpłat wg wypłat + walidacja — per operator ────────────
-print("\n" + "=" * 60)
-print("ROZBICIE PRZELEWÓW BANKOWYCH NA KUPUJĄCYCH (per operator) + WALIDACJA")
-print("=" * 60)
-
-# pobierz wszystkie operacje z szerokiego zakresu dat (bez filtra group)
-wszystkie_operacje = pobierz_wszystkie(
-    f"{API_URL}/payments/payment-operations",
-    {
-        "limit": LIMIT,
-        "occurredAt.gte": DATE_OD,
-        "occurredAt.lte": DATE_DO,
-        "currency": "PLN",
-    },
-)
-
-# posortuj od najstarszej do najnowszej
-wszystkie_operacje.sort(key=lambda x: x["occurredAt"])
-
-NAZWY_OPERATOROW = {
-    "AF":       "Allegro Finance (bezpośredni)",
-    "AF_PAYU":  "Allegro Finance — PayU",
-    "AF_P24":   "Allegro Finance — Przelewy24 (PayPro)",
-    "PAYPRO":   "Allegro Finance — Przelewy24 (PayPro)",
-}
-
-def operator_z_op(op):
-    return op.get("wallet", {}).get("paymentOperator", "UNKNOWN")
-
-WARSAW_TZ = ZoneInfo("Europe/Warsaw")
-
-def data_lokalna(occurred_at_iso):
+def rozlicz_sklep(nazwa_sklepu, auth_headers):
     """
-    occurredAt z API jest w UTC. Wyciąg mBank i panel Allegro pokazują czas
-    lokalny (Europe/Warsaw) — dla transakcji blisko północy surowa data UTC
-    i data lokalna mogą różnić się o 1 dzień. Porównujemy więc zawsze po
-    dacie lokalnej, a nie po surowym occurredAt[:10].
+    Pobiera dane jednego sklepu/konta Allegro i dopasowuje jego wypłaty do
+    WSPÓLNEJ, globalnej puli WYCIAG_PRZELEWY (współdzielonej między sklepami
+    przez flagę "uzyta" — jeden wpis z wyciągu można przypisać tylko raz,
+    do jednego sklepu/operatora).
+
+    Zwraca (wiersze_csv, stats_operator, wszystkie_operacje) dla tego sklepu —
+    wszystkie_operacje jest potrzebne później do diagnostyki sierot (patrz
+    sekcja główna).
     """
-    dt = datetime.fromisoformat(occurred_at_iso.replace("Z", "+00:00"))
-    return dt.astimezone(WARSAW_TZ).date()
+    print("\n" + "#" * 60)
+    print(f"# SKLEP: {nazwa_sklepu}")
+    print("#" * 60)
 
-# zbierz unikalne operatory
-operatory = sorted(set(operator_z_op(o) for o in wszystkie_operacje))
-
-wiersze_csv = []      # do eksportu CSV — patrz KROK 7
-stats_operator = {}   # operator -> {"ok", "rozbieznosci", "suma", "suma_rozbieznosci"} — do LLM, bez PII
-
-for operator in operatory:
-    ops_op = [o for o in wszystkie_operacje if operator_z_op(o) == operator]
-    wplaty    = [o for o in ops_op if o.get("group") == "INCOME"]
-    zwroty_op = [o for o in ops_op if o.get("group") == "REFUND"]
-
-    # Wypłaty bankowe z miesiąca — dopasowane do wyciągu po KWOCIE i DACIE
-    # LOKALNEJ (patrz data_lokalna) z dodatkową tolerancją ±1 dzień na
-    # opóźnienie księgowania w banku (weekend/dzień roboczy).
-    # WYCIAG_PRZELEWY jest dzielony (global, "uzyta" flaga) między operatorami,
-    # żeby ta sama para (data, kwota) nie została dopasowana dwa razy. Gdy
-    # więcej niż jeden wpis z wyciągu pasuje kwotą w oknie ±1 dnia, wybierany
-    # jest ten z najmniejszą różnicą dni (najbliższy).
-    TOLERANCJA_DNI = 1
-    wyplaty_all = sorted(
-        [o for o in ops_op if o.get("type") == "PAYOUT" and o["occurredAt"] >= MIESIAC_OD],
-        key=lambda x: x["occurredAt"]
-    )
-    wyplaty = []
-    for o in wyplaty_all:
-        kwota_abs = round(abs(float(o["value"]["amount"])), 2)
-        data_api  = data_lokalna(o["occurredAt"])
-        kandydaci = sorted(
-            (w for w in WYCIAG_PRZELEWY
-             if not w["uzyta"] and w["kwota"] == kwota_abs
-             and abs((date.fromisoformat(w["data"]) - data_api).days) <= TOLERANCJA_DNI),
-            key=lambda w: abs((date.fromisoformat(w["data"]) - data_api).days)
-        )
-        if kandydaci:
-            kandydaci[0]["uzyta"] = True
-            wyplaty.append(o)
-
-    if not wyplaty:
-        continue
-
-    nazwa_op = NAZWY_OPERATOROW.get(operator, operator)
-    print(f"\n{'═'*60}")
-    print(f"OPERATOR: {nazwa_op}  ({len(wyplaty)} przelewów bankowych)")
-    print(f"{'═'*60}")
-
-    # znajdź ostatnią wypłatę z PRZED miesiącem jako punkt startowy
-    wyplaty_przed = [o for o in ops_op if o.get("type") == "PAYOUT"
-                     and o["occurredAt"] < MIESIAC_OD]
-    prev_time = wyplaty_przed[-1]["occurredAt"] if wyplaty_przed else DATE_OD
-
-    stats_operator.setdefault(operator, {
-        "ok": 0, "rozbieznosci": 0, "suma": 0.0, "suma_rozbieznosci": 0.0,
-    })
-
-    for wyplata in wyplaty:
-        czas_wyplaty      = wyplata["occurredAt"]
-        kwota_wyplaty_abs = round(abs(float(wyplata["value"]["amount"])), 2)
-
-        kupujacy    = [o for o in wplaty if prev_time < o["occurredAt"] <= czas_wyplaty]
-        zwroty_okna = [o for o in zwroty_op if prev_time < o["occurredAt"] <= czas_wyplaty]
-        oplaty_okna = [b for b in oplaty_pobrania if prev_time < b["occurredAt"] <= czas_wyplaty]
-
-        data_wyplaty       = czas_wyplaty[:10]
-        suma_kupujacych    = sum(float(o["value"]["amount"]) for o in kupujacy)
-        suma_zwrotow_abs   = sum(abs(float(o["value"]["amount"])) for o in zwroty_okna)
-        oplaty_rzeczywiste = sum(abs(float(b["value"]["amount"])) for b in oplaty_okna)
-
-        # Walidacja: suma wpłat − suma zwrotów − suma prowizji Allegro = kwota przelewu
-        roznica = round(suma_kupujacych - suma_zwrotow_abs - oplaty_rzeczywiste - kwota_wyplaty_abs, 2)
-        status  = "OK" if abs(roznica) <= TOLERANCJA else f"ROZBIEZNOSC ({roznica:+.2f} PLN)"
-
-        print(f"\n  PRZELEW: {data_wyplaty} | {kwota_wyplaty_abs:.2f} PLN")
-        if kupujacy:
-            for o in kupujacy:
-                p = o.get("participant", {})
-                nazwa = (p.get("companyName") or
-                         f"{p.get('firstName','')} {p.get('lastName','')}".strip())
-                kwota = float(o["value"]["amount"])
-                pid   = o.get("payment", {}).get("id", "—")
-                print(f"    {o['occurredAt'][:10]} | {kwota:>8.2f} PLN | {nazwa} | {pid}")
-        if zwroty_okna:
-            print(f"    --- zwroty ---")
-            for o in zwroty_okna:
-                p = o.get("participant", {})
-                nazwa = (p.get("companyName") or
-                         f"{p.get('firstName','')} {p.get('lastName','')}".strip())
-                kwota = float(o["value"]["amount"])
-                pid   = o.get("payment", {}).get("id", "—")
-                print(f"    {o['occurredAt'][:10]} | {kwota:>8.2f} PLN | ZWROT | {pid} | {nazwa}")
-        if kupujacy or zwroty_okna or oplaty_okna:
-            print(f"    Σ kupujących: {suma_kupujacych:.2f} - prowizja: {oplaty_rzeczywiste:.2f} "
-                  f"- zwroty: {suma_zwrotow_abs:.2f} = {kwota_wyplaty_abs:.2f} PLN  [{status}]")
-        else:
-            print(f"    (brak wpłat w tym oknie)  [{status}]")
-
-        wiersze_csv.append({
-            "data": data_wyplaty,
-            "operator": operator,
-            "kwota_przelewu": f"{kwota_wyplaty_abs:.2f}",
-            "l_kupujacych": len(kupujacy),
-            "oplaty": f"{oplaty_rzeczywiste:.2f}",
-            "zwroty": f"{suma_zwrotow_abs:.2f}",
-            "status": status,
-        })
-        st = stats_operator[operator]
-        st["suma"] += kwota_wyplaty_abs
-        if status == "OK":
-            st["ok"] += 1
-        else:
-            st["rozbieznosci"] += 1
-            st["suma_rozbieznosci"] += abs(roznica)
-
-        prev_time = czas_wyplaty
-
-# ── kwoty z wyciągu bez odpowiadającej wypłaty w Allegro API ─────────────────
-sieroty = [w for w in WYCIAG_PRZELEWY if not w["uzyta"]]
-if sieroty:
-    print("\n" + "=" * 60)
-    print("UWAGA: kwoty z wyciągu BEZ odpowiadającej wypłaty w Allegro API")
     print("=" * 60)
-    for w in sieroty:
-        print(f"  {w['data']} | {w['kwota']:>8.2f} PLN  — sprawdź ręcznie")
-        wiersze_csv.append({
-            "data": w["data"],
-            "operator": "NIEZNANY",
-            "kwota_przelewu": f"{w['kwota']:.2f}",
-            "l_kupujacych": "",
-            "oplaty": "",
-            "zwroty": "",
-            "status": "ROZBIEZNOSC (brak w API)",
+    print(f"WPŁATY OD KUPUJĄCYCH  {DATE_OD[:10]} – {DATE_DO[:10]}")
+    print("=" * 60)
+    ops = pobierz_wszystkie(
+        f"{API_URL}/payments/payment-operations",
+        {"group": "INCOME", "limit": LIMIT, "occurredAt.gte": DATE_OD,
+         "occurredAt.lte": DATE_DO, "currency": "PLN"},
+        auth_headers,
+    )
+    suma_wplat = sum(float(op["value"]["amount"]) for op in ops)
+    print(f"Łącznie wpłat: {len(ops)}  |  Suma: {suma_wplat:.2f} PLN")
+
+    # opłaty Allegro (prowizje z wpływów) — RZECZYWISTA prowizja, potrzebna
+    # do walidacji per przelew niżej, nie wyliczana jako dopełnienie.
+    print("\n" + "=" * 60)
+    print(f"OPŁATY ALLEGRO (prowizje z wpływów)  {DATE_OD[:10]} – {DATE_DO[:10]}")
+    print("=" * 60)
+    billing = pobierz_wszystkie(
+        f"{API_URL}/billing/billing-entries",
+        {"limit": LIMIT, "occurredAt.gte": DATE_OD, "occurredAt.lte": DATE_DO},
+        auth_headers,
+    )
+    oplaty_pobrania = [b for b in billing if b["type"]["name"] == "Pobranie opłat z wpływów"]
+    suma_oplat = sum(float(b["value"]["amount"]) for b in oplaty_pobrania)
+    print(f"Łącznie pozycji: {len(oplaty_pobrania)}  |  Suma: {suma_oplat:.2f} PLN")
+
+    print("\n" + "=" * 60)
+    print("ROZBICIE PRZELEWÓW BANKOWYCH NA KUPUJĄCYCH (per operator) + WALIDACJA")
+    print("=" * 60)
+    wszystkie_operacje = pobierz_wszystkie(
+        f"{API_URL}/payments/payment-operations",
+        {"limit": LIMIT, "occurredAt.gte": DATE_OD, "occurredAt.lte": DATE_DO, "currency": "PLN"},
+        auth_headers,
+    )
+    wszystkie_operacje.sort(key=lambda x: x["occurredAt"])
+    operatory = sorted(set(operator_z_op(o) for o in wszystkie_operacje))
+
+    wiersze_csv_sklepu = []
+    stats_operator_sklepu = {}
+
+    for operator in operatory:
+        ops_op = [o for o in wszystkie_operacje if operator_z_op(o) == operator]
+        wplaty    = [o for o in ops_op if o.get("group") == "INCOME"]
+        zwroty_op = [o for o in ops_op if o.get("group") == "REFUND"]
+
+        # Wypłaty bankowe z miesiąca — dopasowane do wyciągu po KWOCIE i DACIE
+        # LOKALNEJ (patrz data_lokalna) z dodatkową tolerancją ±1 dzień na
+        # opóźnienie księgowania w banku (weekend/dzień roboczy).
+        # WYCIAG_PRZELEWY jest dzielony (global, "uzyta" flaga) między
+        # sklepami i operatorami, żeby ta sama para (data, kwota) nie
+        # została dopasowana dwa razy. Gdy więcej niż jeden wpis z wyciągu
+        # pasuje kwotą w oknie ±1 dnia, wybierany jest ten z najmniejszą
+        # różnicą dni (najbliższy).
+        wyplaty_all = sorted(
+            [o for o in ops_op if o.get("type") == "PAYOUT" and o["occurredAt"] >= MIESIAC_OD],
+            key=lambda x: x["occurredAt"]
+        )
+        wyplaty = []
+        for o in wyplaty_all:
+            kwota_abs = round(abs(float(o["value"]["amount"])), 2)
+            data_api  = data_lokalna(o["occurredAt"])
+            kandydaci = sorted(
+                (w for w in WYCIAG_PRZELEWY
+                 if not w["uzyta"] and w["kwota"] == kwota_abs
+                 and abs((date.fromisoformat(w["data"]) - data_api).days) <= TOLERANCJA_DNI),
+                key=lambda w: abs((date.fromisoformat(w["data"]) - data_api).days)
+            )
+            if kandydaci:
+                kandydaci[0]["uzyta"] = True
+                wyplaty.append(o)
+
+        if not wyplaty:
+            continue
+
+        nazwa_op = NAZWY_OPERATOROW.get(operator, operator)
+        print(f"\n{'═'*60}")
+        print(f"OPERATOR: {nazwa_op}  ({len(wyplaty)} przelewów bankowych)")
+        print(f"{'═'*60}")
+
+        wyplaty_przed = [o for o in ops_op if o.get("type") == "PAYOUT"
+                         and o["occurredAt"] < MIESIAC_OD]
+        prev_time = wyplaty_przed[-1]["occurredAt"] if wyplaty_przed else DATE_OD
+
+        stats_operator_sklepu.setdefault(operator, {
+            "ok": 0, "rozbieznosci": 0, "suma": 0.0, "suma_rozbieznosci": 0.0,
         })
 
-# ── KROK 6: zwroty ────────────────────────────────────────────────────────────
-print("\n" + "=" * 60)
-print(f"ZWROTY  {DATE_OD[:10]} – {DATE_DO[:10]}")
-print("=" * 60)
+        for wyplata in wyplaty:
+            czas_wyplaty      = wyplata["occurredAt"]
+            kwota_wyplaty_abs = round(abs(float(wyplata["value"]["amount"])), 2)
 
-zwroty = pobierz_wszystkie(
-    f"{API_URL}/payments/payment-operations",
-    {
-        "group": "REFUND",
-        "limit": LIMIT,
-        "occurredAt.gte": DATE_OD,
-        "occurredAt.lte": DATE_DO,
-        "currency": "PLN",
-    },
-)
+            kupujacy    = [o for o in wplaty if prev_time < o["occurredAt"] <= czas_wyplaty]
+            zwroty_okna = [o for o in zwroty_op if prev_time < o["occurredAt"] <= czas_wyplaty]
+            oplaty_okna = [b for b in oplaty_pobrania if prev_time < b["occurredAt"] <= czas_wyplaty]
 
-suma_zwrotow = 0.0
-for op in zwroty:
-    p = op.get("participant", {})
-    nazwa   = p.get("companyName") or f"{p.get('firstName','')} {p.get('lastName','')}".strip()
-    kwota   = float(op["value"]["amount"])
-    suma_zwrotow += kwota
-    data_op = op["occurredAt"][:10]
-    pid     = op.get("payment", {}).get("id", "—")
-    typ     = op.get("type", "—")
-    #print(f"{data_op} | {kwota:>8.2f} PLN | {typ:<20} | {pid} | {nazwa}")
+            data_wyplaty       = czas_wyplaty[:10]
+            suma_kupujacych    = sum(float(o["value"]["amount"]) for o in kupujacy)
+            suma_zwrotow_abs   = sum(abs(float(o["value"]["amount"])) for o in zwroty_okna)
+            oplaty_rzeczywiste = sum(abs(float(b["value"]["amount"])) for b in oplaty_okna)
 
-if not zwroty:
-    print("Brak zwrotów w tym okresie.")
+            # Walidacja: suma wpłat − suma zwrotów − suma prowizji Allegro = kwota przelewu
+            roznica = round(suma_kupujacych - suma_zwrotow_abs - oplaty_rzeczywiste - kwota_wyplaty_abs, 2)
+            status  = "OK" if abs(roznica) <= TOLERANCJA else f"ROZBIEZNOSC ({roznica:+.2f} PLN)"
 
-print(f"\nŁącznie zwrotów: {len(zwroty)}  |  Suma: {suma_zwrotow:.2f} PLN")
+            print(f"\n  PRZELEW: {data_wyplaty} | {kwota_wyplaty_abs:.2f} PLN  "
+                  f"[Σ kupujących: {suma_kupujacych:.2f} - prowizja: {oplaty_rzeczywiste:.2f} "
+                  f"- zwroty: {suma_zwrotow_abs:.2f}]  [{status}]")
 
+            wiersze_csv_sklepu.append({
+                "sklep": nazwa_sklepu,
+                "data": data_wyplaty,
+                "operator": operator,
+                "kwota_przelewu": f"{kwota_wyplaty_abs:.2f}",
+                "l_kupujacych": len(kupujacy),
+                "oplaty": f"{oplaty_rzeczywiste:.2f}",
+                "zwroty": f"{suma_zwrotow_abs:.2f}",
+                "status": status,
+            })
+            st = stats_operator_sklepu[operator]
+            st["suma"] += kwota_wyplaty_abs
+            if status == "OK":
+                st["ok"] += 1
+            else:
+                st["rozbieznosci"] += 1
+                st["suma_rozbieznosci"] += abs(roznica)
 
-# ── KROK 7: eksport CSV + opcjonalne podsumowanie LLM ────────────────────────
+            prev_time = czas_wyplaty
+
+    print("\n" + "=" * 60)
+    print(f"ZWROTY  {DATE_OD[:10]} – {DATE_DO[:10]}")
+    print("=" * 60)
+    zwroty = pobierz_wszystkie(
+        f"{API_URL}/payments/payment-operations",
+        {"group": "REFUND", "limit": LIMIT, "occurredAt.gte": DATE_OD,
+         "occurredAt.lte": DATE_DO, "currency": "PLN"},
+        auth_headers,
+    )
+    suma_zwrotow = sum(float(op["value"]["amount"]) for op in zwroty)
+    if not zwroty:
+        print("Brak zwrotów w tym okresie.")
+    print(f"Łącznie zwrotów: {len(zwroty)}  |  Suma: {suma_zwrotow:.2f} PLN")
+
+    return wiersze_csv_sklepu, stats_operator_sklepu, wszystkie_operacje
+
 
 def generuj_podsumowanie_llm(stats):
     """
     Generuje 2-3 zdania podsumowania po polsku na podstawie WYŁĄCZNIE
-    zagregowanych liczb per operator (patrz `stats` — bez PII, bez treści
-    wyciągu). Zwraca None (i drukuje powód) jeśli brak klucza API/pakietu,
-    żeby reszta skryptu (CSV, walidacja) działała niezależnie od LLM.
+    zagregowanych liczb per sklep/operator (patrz `stats` — bez PII, bez
+    treści wyciągu). Zwraca None (i drukuje powód) jeśli brak klucza API/
+    pakietu, żeby reszta skryptu (CSV, walidacja) działała niezależnie od LLM.
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -492,9 +444,9 @@ def generuj_podsumowanie_llm(stats):
 
     client = anthropic.Anthropic(api_key=api_key)
     prompt = (
-        "Jesteś asystentem księgowej sklepu e-commerce. Poniżej masz WYŁĄCZNIE "
+        "Jesteś asystentem księgowej sklepów e-commerce. Poniżej masz WYŁĄCZNIE "
         "zagregowane liczby (bez danych osobowych, bez numerów kont) z "
-        "miesięcznego rozliczenia Allegro Finance, per operator płatności. "
+        "miesięcznego rozliczenia Allegro Finance, per sklep i operator płatności. "
         "Napisz 2-3 zdania podsumowania po polsku: ile przelewów się zgadza, "
         "ile ma rozbieżności i na jaką łączną kwotę, czy coś wymaga uwagi "
         "księgowej przed zaksięgowaniem.\n\n"
@@ -512,6 +464,53 @@ def generuj_podsumowanie_llm(stats):
         return None
 
 
+# ── uruchom rozliczenie dla każdego skonfigurowanego sklepu ──────────────────
+wiersze_csv = []
+stats_wszystkie = {}                       # (sklep, operator) -> stats
+operacje_wszystkich_sklepow = []           # do diagnostyki sierot niżej
+
+for sklep in SKLEPY:
+    auth_headers = autoryzuj(sklep["nazwa"], sklep["client_id"], sklep["client_secret"])
+    wiersze, stats, operacje_sklepu = rozlicz_sklep(sklep["nazwa"], auth_headers)
+    wiersze_csv.extend(wiersze)
+    for operator, dane in stats.items():
+        stats_wszystkie[(sklep["nazwa"], operator)] = dane
+    operacje_wszystkich_sklepow.extend(
+        [{**o, "_sklep": sklep["nazwa"]} for o in operacje_sklepu]
+    )
+
+# ── kwoty z wyciągu bez odpowiadającej wypłaty w ŻADNYM ze sklepów ───────────
+sieroty = [w for w in WYCIAG_PRZELEWY if not w["uzyta"]]
+if sieroty:
+    print("\n" + "=" * 60)
+    print("UWAGA: kwoty z wyciągu BEZ odpowiadającej wypłaty w żadnym sklepie")
+    print("=" * 60)
+    for w in sieroty:
+        print(f"  {w['data']} | {w['kwota']:>8.2f} PLN  — sprawdź ręcznie")
+        # diagnostyka: pokaż zbliżone PAYOUT-y z API (kwota w promieniu 1 PLN,
+        # w dowolnym ze sklepów), żeby zobaczyć czy to np. przesunięcie daty
+        # a nie brak wypłaty w ogóle.
+        kandydaci = [
+            o for o in operacje_wszystkich_sklepow
+            if o.get("type") == "PAYOUT"
+            and abs(round(abs(float(o["value"]["amount"])), 2) - w["kwota"]) < 1.0
+        ]
+        for k in kandydaci:
+            kw_ = round(abs(float(k["value"]["amount"])), 2)
+            print(f"      [diagnostyka] zbliżony PAYOUT w API: {k['occurredAt']} "
+                  f"| {kw_:.2f} PLN | operator={operator_z_op(k)} | sklep={k['_sklep']}")
+        wiersze_csv.append({
+            "sklep": "NIEZNANY",
+            "data": w["data"],
+            "operator": "NIEZNANY",
+            "kwota_przelewu": f"{w['kwota']:.2f}",
+            "l_kupujacych": "",
+            "oplaty": "",
+            "zwroty": "",
+            "status": "ROZBIEZNOSC (brak w API)",
+        })
+
+# ── eksport CSV + opcjonalne podsumowanie LLM ────────────────────────────────
 print("\n" + "=" * 60)
 print("EKSPORT ROZLICZENIA")
 print("=" * 60)
@@ -519,20 +518,21 @@ print("=" * 60)
 plik_csv = f"rozliczenie_{MIESIAC_OD[:7]}.csv"
 with open(plik_csv, "w", newline="", encoding="utf-8") as f:
     writer = csv.DictWriter(
-        f, fieldnames=["data", "operator", "kwota_przelewu", "l_kupujacych",
-                       "oplaty", "zwroty", "status"]
+        f, fieldnames=["sklep", "data", "operator", "kwota_przelewu",
+                       "l_kupujacych", "oplaty", "zwroty", "status"]
     )
     writer.writeheader()
     writer.writerows(wiersze_csv)
 print(f"Zapisano: {plik_csv}  ({len(wiersze_csv)} wierszy)")
 
-stats_dla_llm = [{"operator": op, **dane} for op, dane in stats_operator.items()]
+stats_dla_llm = [
+    {"sklep": sklep, "operator": operator, **dane}
+    for (sklep, operator), dane in stats_wszystkie.items()
+]
 if sieroty:
     stats_dla_llm.append({
-        "operator": "NIEZNANY (brak w API)",
-        "ok": 0,
-        "rozbieznosci": len(sieroty),
-        "suma": 0.0,
+        "sklep": "NIEZNANY", "operator": "NIEZNANY (brak w API)",
+        "ok": 0, "rozbieznosci": len(sieroty), "suma": 0.0,
         "suma_rozbieznosci": round(sum(w["kwota"] for w in sieroty), 2),
     })
 

@@ -5,8 +5,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-CLIENT_ID     = os.environ["ALLEGRO_CLIENT_ID"]
-CLIENT_SECRET = os.environ["ALLEGRO_CLIENT_SECRET"]
+CLIENT_ID     = os.environ["ALLEGRO_PIGMEJKA_CLIENT_ID"]
+CLIENT_SECRET = os.environ["ALLEGRO_PIGMEJKA_CLIENT_SECRET"]
 
 # ── ZAKRES DAT ────────────────────────────────────────────────────────────────
 DATE_OD        = "2025-10-01T00:00:00Z"   # szerszy zakres żeby złapać wpłaty z poprzedniego miesiąca
