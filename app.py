@@ -67,13 +67,10 @@ if not sprawdz_haslo():
 
 
 # ── nagłówek ──────────────────────────────────────────────────────────────────
-col_logo, col_tytul = st.columns([1, 4])
-with col_logo:
-    if Path("logo.png").exists():
-        st.image("logo.png", width=100)
-with col_tytul:
-    st.title("Rozliczenia Allegro Finance")
-    st.markdown("#### mniej czasu na księgowanie = więcej czasu z rodziną")
+if Path("logo.png").exists():
+    st.image("logo.png", width=320)
+st.title("Rozliczenia Allegro Finance")
+st.markdown("#### mniej czasu na księgowanie = więcej czasu z rodziną")
 
 st.divider()
 
