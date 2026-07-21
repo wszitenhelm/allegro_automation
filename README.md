@@ -30,6 +30,19 @@ zbiorczych przelewów bankowych na kupujących, dla sklepów decor4-pl i pigmejk
   podsumowanie tekstowe (na podstawie wyłącznie zagregowanych liczb, patrz
   niżej) — bez klucza ten krok jest po prostu pomijany.
 
+  Logika jest rozbita na moduły, `allegro_rozliczenie.py` to tylko punkt
+  wejścia CLI (argumenty, orkiestracja, eksport CSV):
+  - `config.py` — sklepy z `.env`, stałe, zakres dat
+  - `pdf_parser.py` — parsowanie wyciągu PDF (bez side-effectów sieciowych)
+  - `allegro_api.py` — klient Allegro API (OAuth, pobieranie z paginacją)
+  - `rozliczenie.py` — dopasowanie wypłat do wyciągu + walidacja, per sklep
+  - `llm_summary.py` — opcjonalne podsumowanie tekstowe (Anthropic API)
+
+  Ten podział ma znaczenie przy podpinaniu frontendu: `pdf_parser.py` i
+  `rozliczenie.py` da się wtedy zaimportować i wywołać wprost, bez
+  uruchamiania całego skryptu CLI (który dziś czeka na `input()` i sam
+  odpala OAuth przy imporcie).
+
 ## Setup
 
 ```bash
