@@ -42,6 +42,14 @@ st.set_page_config(
     layout="wide",
 )
 
+# Ukrywa wbudowaną ikonkę Streamlita "aplikacja się wykonuje" (biegnący
+# ludzik) w prawym górnym rogu — nie ma do tego oficjalnego przełącznika,
+# tylko przez CSS na stałym data-testid.
+st.markdown(
+    "<style>[data-testid='stStatusWidget'] {visibility: hidden;}</style>",
+    unsafe_allow_html=True,
+)
+
 
 # ── ochrona hasłem ────────────────────────────────────────────────────────────
 def sprawdz_haslo():
@@ -110,14 +118,23 @@ rozlicz_kliknieto = st.button("Rozlicz", type="primary", disabled=plik is None o
 
 
 def autoryzuj_w_appce(nazwa_sklepu, client_id, client_secret, status):
-    """Wersja OAuth device flow dopasowana do Streamlit: link zamiast input()."""
+    """
+    Wersja OAuth device flow dopasowana do Streamlit: link zamiast input().
+    Różne sklepy mogą być zalogowane w różnych przeglądarkach (np. pigmejka
+    w Safari, decor4 w Chrome) — nie wystarczy przycisk, który otwiera link
+    w BIEŻĄCEJ przeglądarce. Link jest więc też pokazany jako tekst do
+    skopiowania (st.code ma wbudowany przycisk kopiowania), żeby dało się
+    go wkleić w dowolną przeglądarkę z odpowiednim kontem zalogowanym.
+    """
     device = zainicjuj_device_flow(client_id, client_secret)
     status.write(
-        f"**{nazwa_sklepu}**: otwórz link i zatwierdź dostęp w Allegro, "
+        f"**{nazwa_sklepu}**: zatwierdź dostęp w Allegro (skopiuj link poniżej "
+        f"do przeglądarki, w której jesteś zalogowana na to konto), "
         f"potem wróć tutaj — czekam automatycznie."
     )
+    status.code(device["verification_uri_complete"], language=None)
     status.link_button(
-        f"Zatwierdź dostęp do {nazwa_sklepu} →",
+        f"...albo otwórz w tej przeglądarce →",
         device["verification_uri_complete"],
     )
     with st.spinner(f"Czekam na zatwierdzenie dostępu dla {nazwa_sklepu}..."):

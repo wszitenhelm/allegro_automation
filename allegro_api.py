@@ -3,7 +3,11 @@ import sys
 import time
 import requests
 
-from config import BASE_URL, HEADERS
+from config import API_URL, BASE_URL, HEADERS
+
+
+class BrakUprawnienDoZamowien(Exception):
+    """Aplikacja Allegro nie ma włączonego dostępu do odczytu zamówień (Order management)."""
 
 
 def zainicjuj_device_flow(client_id, client_secret):
@@ -78,3 +82,49 @@ def pobierz_wszystkie(url, params, auth_headers):
         if offset >= total or len(batch) == 0:
             break
     return wyniki
+
+
+def pobierz_dane_faktury(payment_id, auth_headers):
+    """
+    Sprawdza czy kupujący zażądał faktury dla zamówienia powiązanego z danym
+    payment.id (payments/payment-operations i order/checkout-forms dzielą
+    to samo ID płatności). Zwraca (required: bool, opis: str) — opis to
+    nazwa firmy + NIP (albo imię i nazwisko), pusty string jeśli faktura
+    niewymagana albo zamówienia nie znaleziono.
+
+    Podnosi BrakUprawnienDoZamowien przy 403, żeby wywołujący mógł przerwać
+    dalsze próby zamiast odpytywać API setki razy o to samo.
+    """
+    r = requests.get(
+        f"{API_URL}/order/checkout-forms",
+        headers=auth_headers,
+        params={"payment.id": payment_id, "limit": 1},
+    )
+    if r.status_code == 403:
+        raise BrakUprawnienDoZamowien(
+            "Brak uprawnień do odczytu zamówień (Order management) — włącz ten "
+            "zakres dla aplikacji w Allegro Developer Portal."
+        )
+    if r.status_code != 200:
+        return False, ""
+
+    formularze = r.json().get("checkoutForms", [])
+    if not formularze:
+        return False, ""
+
+    invoice = formularze[0].get("invoice") or {}
+    if not invoice.get("required"):
+        return False, ""
+
+    address = invoice.get("address") or {}
+    company = address.get("company")
+    if company:
+        nazwa_firmy = company.get("name", "")
+        nipy = [i["value"] for i in company.get("ids", []) if i.get("type") == "PL_NIP"]
+        return True, f"{nazwa_firmy}, NIP: {nipy[0]}" if nipy else nazwa_firmy
+
+    osoba = address.get("naturalPerson")
+    if osoba:
+        return True, f"{osoba.get('firstName', '')} {osoba.get('lastName', '')}".strip()
+
+    return True, ""

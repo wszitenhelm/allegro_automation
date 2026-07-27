@@ -13,22 +13,30 @@ zbiorczych przelewów bankowych na kupujących, dla sklepów decor4-pl i pigmejk
   PDF (`pdftotext`), znajduje w nim przelewy Allegro Finance po **dacie i
   kwocie**, loguje się (OAuth) osobno do każdego skonfigurowanego sklepu i
   dopasowuje jego wypłaty (PAYOUT) do tej samej wspólnej puli przelewów z
-  wyciągu — jeden wpis z wyciągu może trafić tylko do jednego sklepu. Dla
-  każdego przelewu waliduje: `suma wpłat − suma zwrotów − rzeczywista prowizja
-  Allegro (billing API) = kwota przelewu` (z tolerancją 0,00 PLN). Kwoty z
-  wyciągu bez odpowiadającej wypłaty w ŻADNYM sklepie są zgłaszane jako do
-  ręcznego sprawdzenia.
+  wyciągu — jeden wpis z wyciągu może trafić tylko do jednego sklepu.
+
+  Dla każdego przelewu liczy `Pobranie opłat Allegro` jako resztę z równania
+  `Σ zamówień − kwota przelewu − zwroty = Pobranie opłat Allegro` (rzeczywista
+  prowizja Allegro rozlicza się z opóźnieniem, które nie pokrywa się z oknem
+  między przelewami, więc nie da się jej wiarygodnie dopasować per przelew z
+  osobnego zapytania do API). Data każdego przelewu w wyniku to data **z
+  wyciągu bankowego**, nie z Allegro API (mogą się różnić o dzień przez
+  strefę czasową/opóźnienie księgowe banku). Dla kupujących, którzy zażądali
+  faktury, do nazwy dopisywane są dane firmy/NIP (osobne zapytanie do
+  `/order/checkout-forms` per wpłata — wymaga włączonego w Allegro Developer
+  Portal dostępu do odczytu zamówień; bez tego uprawnienia ten krok jest po
+  prostu pomijany).
 
   ```
   python3 allegro_rozliczenie.py wyciag.pdf 2025-11
   ```
 
   Wynik: konsola (szczegóły per sklep/przelew) + plik `rozliczenie_YYYY-MM.csv`
-  (jeden wiersz na przelew bankowy, kolumny: sklep, data, operator,
-  kwota_przelewu, l_kupujacych, oplaty, zwroty, status). Jeśli w `.env` jest
-  ustawiony `ANTHROPIC_API_KEY`, dodatkowo generowane jest 2-3 zdaniowe
-  podsumowanie tekstowe (na podstawie wyłącznie zagregowanych liczb, patrz
-  niżej) — bez klucza ten krok jest po prostu pomijany.
+  (jeden wiersz na przelew bankowy, kolumny: Sklep, Data, Operator, Kwota
+  Przelewu, Liczba kupujących, Suma Zamówień, Pobranie opłat Allegro, Zwroty).
+  Jeśli w `.env` jest ustawiony `ANTHROPIC_API_KEY`, dodatkowo generowane jest
+  2-3 zdaniowe podsumowanie tekstowe (na podstawie wyłącznie zagregowanych
+  liczb, patrz niżej) — bez klucza ten krok jest po prostu pomijany.
 
   Logika jest rozbita na moduły, `allegro_rozliczenie.py` to tylko punkt
   wejścia CLI (argumenty, orkiestracja, eksport CSV):

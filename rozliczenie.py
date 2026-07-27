@@ -2,13 +2,13 @@
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
-from allegro_api import pobierz_wszystkie
+from allegro_api import pobierz_wszystkie, pobierz_dane_faktury, BrakUprawnienDoZamowien
 from config import API_URL, LIMIT, TOLERANCJA_DNI
 
 WARSAW_TZ = ZoneInfo("Europe/Warsaw")
 
 NAZWY_OPERATOROW = {
-    "AF":       "Allegro Finance (bezpośredni)",
+    "AF":       "Allegro Finance",
     "AF_PAYU":  "Allegro Finance — PayU",
     "AF_P24":   "Allegro Finance — Przelewy24 (PayPro)",
     "PAYPRO":   "Allegro Finance — Przelewy24 (PayPro)",
@@ -36,11 +36,37 @@ def _nazwa_uczestnika(op):
 
 
 def _jako_lista(operacje):
-    """Zamienia listę operacji (kupujący/zwroty) na proste dicty do wyświetlenia w UI."""
+    """Zamienia listę operacji (zwroty) na proste dicty do wyświetlenia w UI."""
     return [
         {"data": o["occurredAt"][:10], "kwota": float(o["value"]["amount"]), "nazwa": _nazwa_uczestnika(o)}
         for o in operacje
     ]
+
+
+def _kupujacy_jako_lista(operacje, auth_headers, stan_faktur):
+    """
+    Jak _jako_lista, ale dla kupujących dodatkowo dogrywa dane faktury (jeśli
+    kupujący jej zażądał) i dopisuje je do nazwy. `stan_faktur` to
+    współdzielony dict {"dostepne": bool} — jeśli raz natrafimy na brak
+    uprawnień do zamówień, przestajemy próbować dla kolejnych wpłat zamiast
+    odpytywać API bez sensu setki razy o to samo.
+    """
+    wynik = []
+    for o in operacje:
+        nazwa = _nazwa_uczestnika(o)
+        if stan_faktur["dostepne"]:
+            payment_id = o.get("payment", {}).get("id")
+            if payment_id:
+                try:
+                    wymagana, opis = pobierz_dane_faktury(payment_id, auth_headers)
+                except BrakUprawnienDoZamowien as e:
+                    stan_faktur["dostepne"] = False
+                    print(f"[faktury] {e}")
+                    wymagana, opis = False, ""
+                if wymagana:
+                    nazwa = f"{nazwa} — FAKTURA: {opis}" if opis else f"{nazwa} — FAKTURA"
+        wynik.append({"data": o["occurredAt"][:10], "kwota": float(o["value"]["amount"]), "nazwa": nazwa})
+    return wynik
 
 
 def rozlicz_sklep(nazwa_sklepu, auth_headers, date_od, date_do, miesiac_od, wyciag_przelewy):
@@ -78,6 +104,7 @@ def rozlicz_sklep(nazwa_sklepu, auth_headers, date_od, date_do, miesiac_od, wyci
 
     wiersze_csv_sklepu = []
     stats_operator_sklepu = {}
+    stan_faktur = {"dostepne": True}
 
     for operator in operatory:
         ops_op = [o for o in wszystkie_operacje if operator_z_op(o) == operator]
@@ -108,7 +135,7 @@ def rozlicz_sklep(nazwa_sklepu, auth_headers, date_od, date_do, miesiac_od, wyci
             )
             if kandydaci:
                 kandydaci[0]["uzyta"] = True
-                wyplaty.append(o)
+                wyplaty.append((o, kandydaci[0]))
 
         if not wyplaty:
             continue
@@ -122,19 +149,22 @@ def rozlicz_sklep(nazwa_sklepu, auth_headers, date_od, date_do, miesiac_od, wyci
                          and o["occurredAt"] < miesiac_od]
         prev_time = wyplaty_przed[-1]["occurredAt"] if wyplaty_przed else date_od
 
-        stats_operator_sklepu.setdefault(operator, {
+        stats_operator_sklepu.setdefault(nazwa_op, {
             "liczba_przelewow": 0, "suma_przelewow": 0.0,
             "suma_zamowien": 0.0, "suma_oplat": 0.0, "suma_zwrotow": 0.0,
         })
 
-        for wyplata in wyplaty:
+        for wyplata, wyciag_wpis in wyplaty:
             czas_wyplaty      = wyplata["occurredAt"]
             kwota_wyplaty_abs = round(abs(float(wyplata["value"]["amount"])), 2)
 
             kupujacy    = [o for o in wplaty if prev_time < o["occurredAt"] <= czas_wyplaty]
             zwroty_okna = [o for o in zwroty_op if prev_time < o["occurredAt"] <= czas_wyplaty]
 
-            data_wyplaty     = czas_wyplaty[:10]
+            # data z WYCIĄGU (nie occurredAt z API) — to jest data, którą
+            # księgowa widzi na wyciągu bankowym i po której będzie szukać
+            # tego przelewu, więc tabelka musi się z tym zgadzać.
+            data_wyplaty     = wyciag_wpis["data"]
             suma_kupujacych  = sum(float(o["value"]["amount"]) for o in kupujacy)
             suma_zwrotow_abs = sum(abs(float(o["value"]["amount"])) for o in zwroty_okna)
             # Pobranie opłat Allegro liczone jako reszta z równania (nie z
@@ -145,20 +175,23 @@ def rozlicz_sklep(nazwa_sklepu, auth_headers, date_od, date_do, miesiac_od, wyci
             #   Σ zamówień − kwota przelewu − zwroty = Pobranie opłat Allegro
             oplaty_rzeczywiste = round(suma_kupujacych - kwota_wyplaty_abs - suma_zwrotow_abs, 2)
 
+            # liczone raz i użyte zarówno do printu jak i do wiersza CSV,
+            # żeby nie odpytywać API o fakturę dwa razy dla tego samego kupującego
+            kupujacy_szczegoly = _kupujacy_jako_lista(kupujacy, auth_headers, stan_faktur)
+            zwroty_szczegoly = _jako_lista(zwroty_okna)
+
             print(f"\n  PRZELEW: {data_wyplaty} | {kwota_wyplaty_abs:.2f} PLN  "
                   f"[Σ zamówień: {suma_kupujacych:.2f} - pobranie opłat Allegro: "
                   f"{oplaty_rzeczywiste:.2f} - zwroty: {suma_zwrotow_abs:.2f}]")
-            for o in kupujacy:
-                print(f"    wpłata: {o['occurredAt']} | {float(o['value']['amount']):>8.2f} PLN | "
-                      f"{_nazwa_uczestnika(o)}")
-            for o in zwroty_okna:
-                print(f"    zwrot:  {o['occurredAt']} | {float(o['value']['amount']):>8.2f} PLN | "
-                      f"{_nazwa_uczestnika(o)}")
+            for s in kupujacy_szczegoly:
+                print(f"    wpłata: {s['data']} | {s['kwota']:>8.2f} PLN | {s['nazwa']}")
+            for s in zwroty_szczegoly:
+                print(f"    zwrot:  {s['data']} | {s['kwota']:>8.2f} PLN | {s['nazwa']}")
 
             wiersze_csv_sklepu.append({
                 "sklep": nazwa_sklepu,
                 "data": data_wyplaty,
-                "operator": operator,
+                "operator": nazwa_op,
                 "kwota_przelewu": f"{kwota_wyplaty_abs:.2f}",
                 "l_kupujacych": str(len(kupujacy)),
                 "suma_zamowien": f"{suma_kupujacych:.2f}",
@@ -167,10 +200,10 @@ def rozlicz_sklep(nazwa_sklepu, auth_headers, date_od, date_do, miesiac_od, wyci
                 # nie trafiają do CSV (csv.DictWriter pisze tylko zdefiniowane
                 # fieldnames) — używane przez frontend do pokazania szczegółów
                 # po kliknięciu w wiersz
-                "kupujacy_lista": _jako_lista(kupujacy),
-                "zwroty_lista": _jako_lista(zwroty_okna),
+                "kupujacy_lista": kupujacy_szczegoly,
+                "zwroty_lista": zwroty_szczegoly,
             })
-            st = stats_operator_sklepu[operator]
+            st = stats_operator_sklepu[nazwa_op]
             st["liczba_przelewow"] += 1
             st["suma_przelewow"] += kwota_wyplaty_abs
             st["suma_zamowien"] += suma_kupujacych
