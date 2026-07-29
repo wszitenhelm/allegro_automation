@@ -176,6 +176,10 @@ if rozlicz_kliknieto and plik is not None:
                     stats_wszystkie[(sklep["nazwa"], operator)] = dane
                 status.write(f"✅ {sklep['nazwa']} gotowe.")
 
+            # sortowanie chronologiczne wg daty z wyciągu — bez tego wiersze
+            # są w kolejności w jakiej przetwarzane były sklepy/operatory
+            wiersze_csv.sort(key=lambda w: w["data"])
+
             status.update(label="Gotowe!", state="complete")
 
         st.session_state["wyniki"] = {

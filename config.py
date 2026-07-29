@@ -15,13 +15,14 @@ HEADERS  = {"Accept": "application/vnd.allegro.public.v1+json"}
 
 # Kolumny wyniku rozliczenia (CSV i frontend) — wspólne, żeby oba miejsca
 # eksportu pokazywały to samo.
-KOLUMNY_WYNIKU = ["sklep", "data", "operator", "kwota_przelewu",
+KOLUMNY_WYNIKU = ["sklep", "data", "operator", "kwota_przelewu", "waluta",
                   "l_kupujacych", "suma_zamowien", "oplaty", "zwroty"]
 NAZWY_KOLUMN_WYNIKU = {
     "sklep": "Sklep",
     "data": "Data",
     "operator": "Operator",
     "kwota_przelewu": "Kwota Przelewu",
+    "waluta": "Waluta",
     "l_kupujacych": "Liczba kupujących",
     "suma_zamowien": "Suma Zamówień",
     "oplaty": "Pobranie opłat Allegro",

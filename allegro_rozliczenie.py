@@ -78,6 +78,11 @@ def main():
         for operator, dane in stats.items():
             stats_wszystkie[(sklep["nazwa"], operator)] = dane
 
+    # sortowanie chronologiczne wg daty z wyciągu — bez tego wiersze są w
+    # kolejności w jakiej przetwarzane były sklepy/operatory, nie w kolejności
+    # jak na wyciągu bankowym
+    wiersze_csv.sort(key=lambda w: w["data"])
+
     # eksport CSV
     print("\n" + "=" * 60)
     print("EKSPORT ROZLICZENIA")

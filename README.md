@@ -33,10 +33,25 @@ zbiorczych przelewów bankowych na kupujących, dla sklepów decor4-pl i pigmejk
 
   Wynik: konsola (szczegóły per sklep/przelew) + plik `rozliczenie_YYYY-MM.csv`
   (jeden wiersz na przelew bankowy, kolumny: Sklep, Data, Operator, Kwota
-  Przelewu, Liczba kupujących, Suma Zamówień, Pobranie opłat Allegro, Zwroty).
-  Jeśli w `.env` jest ustawiony `ANTHROPIC_API_KEY`, dodatkowo generowane jest
-  2-3 zdaniowe podsumowanie tekstowe (na podstawie wyłącznie zagregowanych
-  liczb, patrz niżej) — bez klucza ten krok jest po prostu pomijany.
+  Przelewu, Waluta, Liczba kupujących, Suma Zamówień, Pobranie opłat Allegro,
+  Zwroty). Jeśli w `.env` jest ustawiony `ANTHROPIC_API_KEY`, dodatkowo
+  generowane jest 2-3 zdaniowe podsumowanie tekstowe (na podstawie wyłącznie
+  zagregowanych liczb, patrz niżej) — bez klucza ten krok jest po prostu
+  pomijany.
+
+  **Sprzedaż zagraniczna (EUR/CZK/HUF):** niektóre operatory (np. PayU —
+  Allegro Finance dla allegro.cz/sk/hu) prowadzą osobny portfel w obcej
+  walucie, wypłacany na to samo (złotówkowe) konto bankowe po przewalutowaniu.
+  Allegro nie udostępnia w API ani kursu, ani przeliczonej kwoty PLN, więc
+  takie wypłaty są dopasowywane do wyciągu **po dacie** (nie po kwocie) wśród
+  wpisów jeszcze niewykorzystanych przez dopasowania PLN (te mają
+  pierwszeństwo, bo są jednoznaczne), a dopasowanie jest dodatkowo
+  weryfikowane kursem średnim NBP z danego dnia (`nbp.py`, publiczne API) —
+  oczekiwana kwota PLN musi się zgadzać z wpisem z wyciągu z tolerancją ±10%.
+  W wyniku taki wiersz ma `Waluta` = EUR/CZK/HUF, kolumna `Kwota Przelewu`
+  pokazuje obie wartości (np. `185.30 zł (44.17 EUR)`), a `Suma Zamówień` /
+  `Pobranie opłat Allegro` / `Zwroty` zostają w oryginalnej walucie (bez
+  przeliczania kursem).
 
   Logika jest rozbita na moduły, `allegro_rozliczenie.py` to tylko punkt
   wejścia CLI (argumenty, orkiestracja, eksport CSV):
@@ -44,6 +59,7 @@ zbiorczych przelewów bankowych na kupujących, dla sklepów decor4-pl i pigmejk
   - `pdf_parser.py` — parsowanie wyciągu PDF (bez side-effectów sieciowych)
   - `allegro_api.py` — klient Allegro API (OAuth, pobieranie z paginacją)
   - `rozliczenie.py` — dopasowanie wypłat do wyciągu + walidacja, per sklep
+  - `nbp.py` — kursy NBP, do weryfikacji dopasowania wypłat w obcej walucie
   - `llm_summary.py` — opcjonalne podsumowanie tekstowe (Anthropic API)
 
   Ten podział ma znaczenie przy podpinaniu frontendu: `pdf_parser.py` i
