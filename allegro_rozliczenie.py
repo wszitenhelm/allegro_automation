@@ -71,10 +71,11 @@ def main():
         )
         wiersze_csv.extend(wiersze)
 
-    # sortowanie chronologiczne wg daty z wyciągu — bez tego wiersze są w
-    # kolejności w jakiej przetwarzane były sklepy/operatory, nie w kolejności
-    # jak na wyciągu bankowym
-    wiersze_csv.sort(key=lambda w: w["data"])
+    # sortowanie w TEJ SAMEJ kolejności co na wyciągu bankowym (nie tylko po
+    # dacie — bez tego wiersze zostają w kolejności w jakiej przetwarzane
+    # były sklepy/operatory, a kilka przelewów tego samego dnia ma
+    # niedeterministyczną kolejność względem siebie)
+    wiersze_csv.sort(key=lambda w: w["linia_idx"])
 
     # eksport CSV
     print("\n" + "=" * 60)

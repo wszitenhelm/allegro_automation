@@ -201,9 +201,11 @@ if rozlicz_kliknieto and plik is not None:
                 wiersze_csv.extend(wiersze)
                 status.markdown(f"**{sklep['nazwa']}** gotowe.")
 
-            # sortowanie chronologiczne wg daty z wyciągu — bez tego wiersze
-            # są w kolejności w jakiej przetwarzane były sklepy/operatory
-            wiersze_csv.sort(key=lambda w: w["data"])
+            # sortowanie w TEJ SAMEJ kolejności co na wyciągu bankowym (nie
+            # tylko po dacie — kilka przelewów tego samego dnia ma inaczej
+            # niedeterministyczną kolejność względem siebie, bo bez tego
+            # zostają w kolejności w jakiej przetwarzane były sklepy/operatory)
+            wiersze_csv.sort(key=lambda w: w["linia_idx"])
 
             # W tym momencie każdy wpis w wyciag_przelewy ma już ustaloną
             # ostateczną flagę "uzyta" (po wszystkich sklepach) — dokładnie to,

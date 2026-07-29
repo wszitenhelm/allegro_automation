@@ -171,10 +171,13 @@ def _przetworz_okna(nazwa_sklepu, nazwa_op, waluta, wyplaty_dopasowane, wplaty, 
             "oplaty": f"{oplaty_rzeczywiste:.2f}",
             "zwroty": f"{suma_zwrotow_abs:.2f}",
             # nie trafiają do CSV (csv.DictWriter pisze tylko zdefiniowane
-            # fieldnames) — używane przez frontend do pokazania szczegółów
-            # po kliknięciu w wiersz
+            # fieldnames) — kupujacy_lista/zwroty_lista używane przez frontend
+            # do pokazania szczegółów po kliknięciu w wiersz, linia_idx do
+            # sortowania wyniku w tej samej kolejności co na wyciągu (patrz
+            # pdf_parser.py)
             "kupujacy_lista": kupujacy_szczegoly,
             "zwroty_lista": zwroty_szczegoly,
+            "linia_idx": wyciag_wpis["linia_idx"],
         })
         st = stats_operator_sklepu[klucz_stats]
         st["liczba_przelewow"] += 1

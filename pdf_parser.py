@@ -81,6 +81,12 @@ def parsuj_pdf_mbank(sciezka):
                             "data": dopasowanie_daty.group(1),
                             "kwota": liczby[0],
                             "uzyta": False,
+                            # numer linii w wyciągu (kolejność top-to-bottom w
+                            # PDF-ie) — używane do sortowania wyniku w TEJ SAMEJ
+                            # kolejności co na wyciągu, nie tylko po samej dacie
+                            # (kilka przelewów tego samego dnia miałoby inaczej
+                            # niedeterministyczną kolejność względem siebie).
+                            "linia_idx": j,
                         })
                     przetworzone.add(j)
                 break
