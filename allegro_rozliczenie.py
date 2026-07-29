@@ -17,12 +17,9 @@ dopasowuje jego wypłaty do tej samej wspólnej puli przelewów z wyciągu —
 jeden wpis z wyciągu może zostać przypisany tylko do jednego sklepu.
 Sklep bez ustawionych zmiennych w .env jest po prostu pomijany.
 
-Opcjonalnie (podsumowanie tekstowe): ustaw ANTHROPIC_API_KEY w .env.
-Bez tego skrypt działa normalnie, tylko pomija ten krok.
-
 Logika rozliczenia jest w osobnych modułach (config.py, pdf_parser.py,
-allegro_api.py, rozliczenie.py, llm_summary.py) — ten plik to tylko punkt
-wejścia CLI (argumenty, orkiestracja, eksport CSV).
+allegro_api.py, rozliczenie.py) — ten plik to tylko punkt wejścia CLI
+(argumenty, orkiestracja, eksport CSV).
 """
 import csv
 import re
@@ -32,7 +29,6 @@ from config import wczytaj_sklepy, zakres_dat, KOLUMNY_WYNIKU, NAZWY_KOLUMN_WYNI
 from pdf_parser import parsuj_pdf_mbank
 from allegro_api import autoryzuj
 from rozliczenie import rozlicz_sklep
-from llm_summary import generuj_podsumowanie_llm
 
 
 def ustal_parametry():
@@ -67,16 +63,13 @@ def main():
     date_od, date_do, miesiac_od, wyciag_przelewy = ustal_parametry()
 
     wiersze_csv = []
-    stats_wszystkie = {}  # (sklep, operator) -> stats
 
     for sklep in sklepy:
         auth_headers = autoryzuj(sklep["nazwa"], sklep["client_id"], sklep["client_secret"])
-        wiersze, stats, _ = rozlicz_sklep(
+        wiersze, _stats, _operacje = rozlicz_sklep(
             sklep["nazwa"], auth_headers, date_od, date_do, miesiac_od, wyciag_przelewy
         )
         wiersze_csv.extend(wiersze)
-        for operator, dane in stats.items():
-            stats_wszystkie[(sklep["nazwa"], operator)] = dane
 
     # sortowanie chronologiczne wg daty z wyciągu — bez tego wiersze są w
     # kolejności w jakiej przetwarzane były sklepy/operatory, nie w kolejności
@@ -94,17 +87,6 @@ def main():
         writer = csv.DictWriter(f, fieldnames=KOLUMNY_WYNIKU, extrasaction="ignore")
         writer.writerows(wiersze_csv)
     print(f"Zapisano: {plik_csv}  ({len(wiersze_csv)} wierszy)")
-
-    # opcjonalne podsumowanie LLM
-    stats_dla_llm = [
-        {"sklep": sklep, "operator": operator, **dane}
-        for (sklep, operator), dane in stats_wszystkie.items()
-    ]
-
-    podsumowanie = generuj_podsumowanie_llm(stats_dla_llm)
-    if podsumowanie:
-        print("\n--- Podsumowanie ---")
-        print(podsumowanie)
 
 
 if __name__ == "__main__":

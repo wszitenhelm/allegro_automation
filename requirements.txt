@@ -1,6 +1,6 @@
 requests
 python-dotenv
-anthropic
 streamlit
 pandas
 watchdog
+pymupdf

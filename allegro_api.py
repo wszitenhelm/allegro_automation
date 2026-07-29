@@ -27,6 +27,11 @@ def czekaj_na_token(client_id, client_secret, device, nazwa_sklepu="sklep"):
     dostępu w przeglądarce (albo nie skończy się limit prób). Zwraca auth_headers.
     Wspólne dla CLI (autoryzuj) i frontendu (app.py), które różnią się tylko tym,
     jak proszą użytkownika o kliknięcie w link.
+
+    Rzuca RuntimeError (nie sys.exit) — ta funkcja jest wywoływana też z
+    app.py (Streamlit), gdzie sys.exit ubiłby całą sesję użytkowniczki zamiast
+    pokazać się jako zwykły komunikat błędu. CLI (autoryzuj() niżej) łapie
+    ten wyjątek i dopiero on woła sys.exit.
     """
     interval = device.get("interval", 5)
     while True:
@@ -44,7 +49,7 @@ def czekaj_na_token(client_id, client_secret, device, nazwa_sklepu="sklep"):
         if data.get("error") == "authorization_pending":
             time.sleep(interval)
         else:
-            sys.exit(f"[{nazwa_sklepu}] Błąd autoryzacji: {data}")
+            raise RuntimeError(f"[{nazwa_sklepu}] Błąd autoryzacji: {data}")
 
 
 def autoryzuj(nazwa_sklepu, client_id, client_secret):
@@ -57,7 +62,10 @@ def autoryzuj(nazwa_sklepu, client_id, client_secret):
     input()
 
     print(f"[{nazwa_sklepu}] Pobieram token...")
-    auth_headers = czekaj_na_token(client_id, client_secret, device, nazwa_sklepu)
+    try:
+        auth_headers = czekaj_na_token(client_id, client_secret, device, nazwa_sklepu)
+    except RuntimeError as e:
+        sys.exit(str(e))
     print(f"[{nazwa_sklepu}] Token OK.\n")
     return auth_headers
 

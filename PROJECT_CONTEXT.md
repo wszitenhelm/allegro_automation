@@ -70,13 +70,23 @@ tylko generuje gotowe zestawienie do ręcznego/pół-automatycznego księgowania
 - `nbp.py` — kursy NBP (`kurs_nbp(waluta, dzien)`), do walidacji dopasowań
   w obcej walucie. Publiczne, darmowe API `api.nbp.pl`, tabela A (kursy
   średnie), z fallbackiem na wcześniejszy dzień roboczy (weekendy/święta).
-- `llm_summary.py` — opcjonalne 2-3 zdaniowe podsumowanie tekstowe
-  (Anthropic API, model `claude-haiku-4-5-20251001`). Dostaje WYŁĄCZNIE
-  zagregowane liczby (per sklep/operator: liczba przelewów, sumy) — nigdy
-  treść wyciągu ani dane osobowe kupujących. Brak klucza = krok pomijany,
-  reszta programu działa normalnie.
+- `pdf_highlight.py` — `zaznacz_dopasowane(sciezka_pdf, wyciag_przelewy)`:
+  zwraca bajty kopii wgranego wyciągu PDF z zielonym podświetleniem
+  wierszy odpowiadających wpisom z `wyciag_przelewy`, które mają
+  `"uzyta"=True` (czyli zostały dopasowane w `rozliczenie.py`). Używane
+  przez `app.py`, żeby księgowa mogła pobrać wyciąg i zobaczyć jednym
+  rzutem oka, co jest już rozliczone (zielone) a co trzeba sprawdzić
+  ręcznie (bez podświetlenia). Patrz szczegóły w sekcji "Podświetlony
+  PDF" niżej.
 - `app.py` — frontend Streamlit dla osoby nietechnicznej (patrz sekcja
   "Frontend" niżej).
+
+**Usunięte:** `llm_summary.py` (opcjonalne podsumowanie tekstowe przez
+Anthropic API) zostało usunięte na życzenie użytkowniczki — razem z nim
+zależność `anthropic` z `requirements.txt` i `ANTHROPIC_API_KEY` z
+`.env.example`/`.streamlit/secrets.toml.example`. Jeśli coś w przyszłości
+znowu odwołuje się do tych nazw, to znak że dokumentacja/kod nie zostały
+w pełni zaktualizowane.
 - `logo.png` / `logo.avif` — logo firmy (szaro-pomarańczowe), użyte w
   nagłówku appki.
 - `.streamlit/config.toml` — motyw kolorystyczny (szaro-pomarańczowy,
@@ -154,6 +164,47 @@ Operator w PEŁNEJ nazwie (np. "Allegro Finance", "Allegro Finance — PayU"),
 nie skrótem (AF, AF_PAYU). Wynik jest sortowany chronologicznie po dacie
 z wyciągu.
 
+## Podświetlony PDF (`pdf_highlight.py`)
+
+Po rozliczeniu wszystkich sklepów, `app.py` woła
+`zaznacz_dopasowane(sciezka_pdf, wyciag_przelewy)`, która zwraca kopię
+wgranego wyciągu z zielonym podświetleniem (prawdziwa adnotacja PDF typu
+Highlight, przez PyMuPDF/`fitz`) każdego wiersza odpowiadającego wpisowi
+z `"uzyta"=True`. Niepodświetlone wiersze = nie zostały dopasowane =
+sygnał dla księgowej, że trzeba je sprawdzić ręcznie.
+
+**Celowo nie re-implementuje wykrywania przelewów** z `pdf_parser.py` (to
+najbardziej dopracowana i przetestowana część systemu) — zamiast tego, dla
+każdego już potwierdzonego (data, kwota) po prostu SZUKA tej samej pary w
+PDF-ie i podświetla znalezioną linię, reużywając `DATA_LINIA_RE`,
+`KWOTA_RE` i `kwota_z_liczb` bezpośrednio z `pdf_parser.py` (import, nie
+kopia) — żeby nie mieć dwóch niezależnych, mogących się rozjechać
+implementacji tej samej logiki odczytu kwoty.
+
+**Ważna pułapka odkryta przy budowie tej funkcji:** `fitz`/PyMuPDF grupuje
+tekst w "linie" na poziomie STRUKTURY PDF-a (bloki/linie z
+`get_text("dict")`), a nie wizualnie — w tym konkretnym wyciągu mBank data
+i kwota w tej samej wizualnej linii tabeli są osobnymi obiektami
+tekstowymi (osobne kolumny), więc trafiają do RÓŻNYCH "linii" fitza mimo
+tej samej pozycji Y. Naiwne użycie fitzowych linii dawało dopasowanie
+tylko ~6 z 29 oczekiwanych wpisów w teście. Rozwiązanie: `_linie_strony()`
+buduje wiersze samodzielnie — zbiera wszystkie fragmenty tekstu (spany) ze
+strony i grupuje je po środku Y z tolerancją `TOLERANCJA_Y=3pt`, sortując
+w każdej grupie po X (lewo→prawo) — czyli robi ręcznie to, co
+`pdftotext -layout` (używane w `pdf_parser.py`) robi automatycznie. Po tej
+poprawce test na prawdziwym `wyciag_listopad.pdf` (58 wpisów, połowa
+oznaczona syntetycznie jako "uzyta") dał dokładnie 29/29 trafień.
+
+Zduplikowane pary (data, kwota) — np. dwa różne przelewy tego samego dnia
+na tę samą kwotę — są obsłużone licznikiem `do_znalezienia` (ile razy dany
+klucz jeszcze trzeba znaleźć), żeby nie podświetlić dwa razy tej samej
+linii i pominąć drugie wystąpienie.
+
+Jeśli `zaznacz_dopasowane` rzuci wyjątek (np. nietypowy PDF, którego fitz
+nie otworzy), `app.py` łapie to i po prostu nie pokazuje przycisku pobrania
+podświetlonego PDF — tabela wyników i CSV działają niezależnie od tego
+kroku (ta sama filozofia co przy poprzednio usuniętym `llm_summary.py`).
+
 ## Rzeczy, które NIE działają / zostały świadomie odrzucone
 
 - **Status OK/ROZBIEŻNOŚĆ i "sieroty"** (kwoty z wyciągu bez dopasowania) —
@@ -168,27 +219,43 @@ z wyciągu.
 ## Frontend (Streamlit, `app.py`)
 
 - Nagłówek: logo + hasło "mniej czasu na księgowanie = więcej czasu z
-  rodziną", motyw szaro-pomarańczowy, `layout="wide"`.
+  rodziną", motyw szaro-pomarańczowy, `layout="wide"`. Bez emoji nigdzie
+  na stronie (świadomie usunięte na życzenie użytkowniczki) i bez
+  wbudowanego menu Streamlita/przycisku Deploy (`[client] toolbarMode =
+  "minimal"` w `.streamlit/config.toml`, bo dawało dostęp do niepotrzebnych
+  tu opcji deweloperskich jak "Clear cache").
+- Komunikat przed uploadem: przypomnienie, żeby zalogować się na
+  allegro.pl/logowanie do pigmejka i decor4 w DWÓCH OSOBNYCH przeglądarkach
+  przed kliknięciem "Rozlicz" (żeby autoryzacja OAuth niżej zadziałała bez
+  przełączania kont).
 - Upload wyciągu PDF, wybór roku/miesiąca, multiselect sklepów (można
   rozliczyć tylko wybrane — reszta po prostu nie pojawi się w wyniku, bez
   fałszywych ostrzeżeń).
-- OAuth: dla każdego sklepu pokazuje link **jako tekst do skopiowania**
-  (`st.code`, ma przycisk kopiowania) — bo różne sklepy bywają zalogowane w
+- OAuth: dla każdego sklepu osobna karta (`st.container(border=True)`) z
+  głównym przyciskiem "Zatwierdź dostęp →" (otwiera link w bieżącej
+  przeglądarce) i linkiem zapasowym do skopiowania schowanym pod
+  popoverem "Inna przeglądarka?" — bo różne sklepy bywają zalogowane w
   różnych przeglądarkach (np. pigmejka w Safari, decor4 w Chrome), więc
   przycisk otwierający w bieżącej przeglądarce nie zawsze wystarcza.
   Ukryta wbudowana ikonka Streamlita "aplikacja się wykonuje" (CSS na
-  `data-testid=stStatusWidget`).
+  `data-testid=stStatusWidget`). Błąd autoryzacji (`RuntimeError` z
+  `czekaj_na_token`) jest łapany i pokazany przez `st.error`, nie ubija
+  całej sesji.
 - Tabela wyników: klikalne wiersze — po kliknięciu pokazuje się lista
   kupujących i zwrotów dla tego okna (w oryginalnej walucie).
-- Przycisk pobrania CSV.
-- Opcjonalne podsumowanie LLM na dole.
+- Dwa przyciski pobrania obok siebie: CSV (do księgowania) i podświetlony
+  PDF (patrz sekcja "Podświetlony PDF" wyżej) — ten drugi pokazuje się
+  tylko jeśli faktycznie coś zostało dopasowane.
 - **Uwaga:** appka lokalnie uruchamiana jest na PRAWDZIWEJ maszynie
   użytkowniczki (nie w sandboxie asystenta) — `streamlit run app.py` na
   `localhost:8501`, więc testy "uruchom to" i realne testy przez
   użytkowniczkę w przeglądarce to ten sam proces.
 - Deploy docelowy: Streamlit Community Cloud (jeszcze nie zrobiony/potwierdzony
   jako aktywny — sprawdzić przy następnej sesji). `packages.txt` zawiera
-  `poppler-utils` (dla `pdftotext` na serwerze).
+  `poppler-utils` (dla `pdftotext` na serwerze); `pymupdf` (dla podświetlania
+  PDF) jest w `requirements.txt` i nie wymaga żadnego systemowego pakietu.
+- Hasło dostępu (`APP_PASSWORD`) porównywane przez `hmac.compare_digest`
+  (stały czas porównania), nie zwykłym `==`.
 
 ## Historia sesji / jak pracujemy razem
 
@@ -218,6 +285,15 @@ z wyciągu.
   JSON), poproszenie użytkowniczki o uruchomienie na prawdziwych danych, i
   dopiero na tej podstawie projektowanie poprawki. To sprawdzony wzorzec
   pracy w tym projekcie — warto go powtarzać zamiast zgadywać kształt API.
+- Przy usuwaniu `llm_summary.py` znaleziony i naprawiony realny bug:
+  `czekaj_na_token` w `allegro_api.py` używał `sys.exit()` mimo że jest
+  wywoływana też z `app.py` (Streamlit) — dokładnie ten sam problem, który
+  celowo rozwiązano w `pdf_parser.py` (RuntimeError zamiast sys.exit), ale
+  przeoczono tutaj. Naprawione: rzuca teraz `RuntimeError`, `autoryzuj()`
+  (CLI) łapie go i dopiero on woła `sys.exit`, `app.py` łapie go i pokazuje
+  `st.error` bez ubijania sesji. Przy okazji: duplikacja logiki
+  "znajdź najbliższego kandydata z wyciągu" między przebiegiem PLN i walut
+  obcych w `rozliczenie.py` wyciągnięta do wspólnej `_znajdz_najblizszy()`.
 
 ## Otwarte tematy na przyszłość
 

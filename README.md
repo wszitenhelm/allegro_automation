@@ -34,10 +34,7 @@ zbiorczych przelewów bankowych na kupujących, dla sklepów decor4-pl i pigmejk
   Wynik: konsola (szczegóły per sklep/przelew) + plik `rozliczenie_YYYY-MM.csv`
   (jeden wiersz na przelew bankowy, kolumny: Sklep, Data, Operator, Kwota
   Przelewu, Waluta, Liczba kupujących, Suma Zamówień, Pobranie opłat Allegro,
-  Zwroty). Jeśli w `.env` jest ustawiony `ANTHROPIC_API_KEY`, dodatkowo
-  generowane jest 2-3 zdaniowe podsumowanie tekstowe (na podstawie wyłącznie
-  zagregowanych liczb, patrz niżej) — bez klucza ten krok jest po prostu
-  pomijany.
+  Zwroty).
 
   **Sprzedaż zagraniczna (EUR/CZK/HUF):** niektóre operatory (np. PayU —
   Allegro Finance dla allegro.cz/sk/hu) prowadzą osobny portfel w obcej
@@ -60,7 +57,8 @@ zbiorczych przelewów bankowych na kupujących, dla sklepów decor4-pl i pigmejk
   - `allegro_api.py` — klient Allegro API (OAuth, pobieranie z paginacją)
   - `rozliczenie.py` — dopasowanie wypłat do wyciągu + walidacja, per sklep
   - `nbp.py` — kursy NBP, do weryfikacji dopasowania wypłat w obcej walucie
-  - `llm_summary.py` — opcjonalne podsumowanie tekstowe (Anthropic API)
+  - `pdf_highlight.py` — generuje kopię wyciągu PDF z zielonym podświetleniem
+    dopasowanych wpisów (używane przez `app.py`)
 
   Ten podział ma znaczenie przy podpinaniu frontendu: `pdf_parser.py` i
   `rozliczenie.py` da się wtedy zaimportować i wywołać wprost, bez
@@ -70,8 +68,10 @@ zbiorczych przelewów bankowych na kupujących, dla sklepów decor4-pl i pigmejk
 - `app.py` — frontend (Streamlit) dla osoby nietechnicznej: wgraj wyciąg PDF,
   wybierz rok/miesiąc, kliknij "Rozlicz". Loguje się przez link (bez
   terminala) osobno do każdego skonfigurowanego sklepu, pokazuje tabelę
-  wyników (kolorowany status OK/ROZBIEZNOSC) i przycisk pobrania CSV.
-  Opcjonalnie chroniona hasłem (`APP_PASSWORD` w sekretach) — patrz niżej.
+  wyników oraz dwa przyciski pobrania: CSV do księgowania i kopię wyciągu
+  PDF z zielonym podświetleniem dopasowanych wpisów (niepodświetlone —
+  do sprawdzenia ręcznie). Opcjonalnie chroniona hasłem (`APP_PASSWORD`
+  w sekretach) — patrz niżej.
 
 ## Frontend (Streamlit)
 
@@ -91,9 +91,8 @@ streamlit run app.py
    wybierz to repo, branch `main`, plik główny `app.py`.
 3. W ustawieniach aplikacji → "Secrets" wklej zawartość
    `.streamlit/secrets.toml.example` uzupełnioną prawdziwymi danymi (Client
-   ID/Secret per sklep, opcjonalnie `ANTHROPIC_API_KEY`, i `APP_PASSWORD` —
-   proste hasło, żeby nikt obcy z linkiem nie odpalił rozliczenia na Waszym
-   koncie Allegro).
+   ID/Secret per sklep i `APP_PASSWORD` — proste hasło, żeby nikt obcy z
+   linkiem nie odpalił rozliczenia na Waszym koncie Allegro).
 4. `packages.txt` (poppler-utils) sprawia, że `pdftotext` jest dostępny na
    serwerze Streamlit — nic dodatkowo nie trzeba instalować.
 5. Dostajesz publiczny link (`*.streamlit.app`). Każdy kolejny `git push` do
@@ -120,7 +119,5 @@ otwórz podany link w przeglądarce i zatwierdź dostęp.
 
 - `.env` (sekrety), `*.pdf` (rzeczywiste wyciągi bankowe) i `rozliczenie_*.csv`
   (wygenerowane rozliczenia) są w `.gitignore` — nigdy nie trafiają do repozytorium.
-- Wyciąg bankowy jest przetwarzany wyłącznie lokalnie. Do LLM (opcjonalne
-  podsumowanie w `allegro_rozliczenie.py`) trafiają WYŁĄCZNIE zagregowane
-  liczby per operator (ile przelewów, jakie sumy) — nigdy treść wyciągu,
-  numer konta ani dane osobowe kupujących.
+- Wyciąg bankowy jest przetwarzany wyłącznie lokalnie/na serwerze Streamlit —
+  nigdzie indziej (nie trafia do żadnego zewnętrznego LLM/API).

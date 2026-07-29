@@ -5,10 +5,11 @@ miesiąc, dostań gotowe rozliczenie do zaksięgowania.
 Uruchomienie lokalne:
   streamlit run app.py
 
-Sekrety (ALLEGRO_*_CLIENT_ID/SECRET, ANTHROPIC_API_KEY, APP_PASSWORD)
-czytane są z .streamlit/secrets.toml lokalnie, albo z panelu "Secrets" na
-Streamlit Community Cloud po wdrożeniu — patrz .streamlit/secrets.toml.example.
+Sekrety (ALLEGRO_*_CLIENT_ID/SECRET, APP_PASSWORD) czytane są z
+.streamlit/secrets.toml lokalnie, albo z panelu "Secrets" na Streamlit
+Community Cloud po wdrożeniu — patrz .streamlit/secrets.toml.example.
 """
+import hmac
 import os
 import tempfile
 from pathlib import Path
@@ -27,7 +28,7 @@ except FileNotFoundError:
 
 from allegro_api import zainicjuj_device_flow, czekaj_na_token
 from config import wczytaj_sklepy, zakres_dat, KOLUMNY_WYNIKU, NAZWY_KOLUMN_WYNIKU
-from llm_summary import generuj_podsumowanie_llm
+from pdf_highlight import zaznacz_dopasowane
 from pdf_parser import parsuj_pdf_mbank
 from rozliczenie import rozlicz_sklep
 
@@ -38,7 +39,7 @@ MIESIACE = [
 
 st.set_page_config(
     page_title="Rozliczenia Allegro Finance",
-    page_icon="logo.png" if Path("logo.png").exists() else "📊",
+    page_icon="logo.png" if Path("logo.png").exists() else None,
     layout="wide",
 )
 
@@ -59,10 +60,13 @@ def sprawdz_haslo():
     if st.session_state.get("zalogowany"):
         return True
 
-    st.markdown("### 🔒 Dostęp chroniony")
+    st.markdown("### Dostęp chroniony")
     haslo = st.text_input("Hasło", type="password")
     if st.button("Zaloguj"):
-        if haslo == haslo_wymagane:
+        # hmac.compare_digest zamiast == — porównanie w stałym czasie, żeby
+        # różnica w czasie odpowiedzi nie zdradzała ile znaków hasła zgadza się
+        # z prawdziwym (standardowa praktyka przy porównywaniu sekretów).
+        if hmac.compare_digest(haslo, haslo_wymagane):
             st.session_state["zalogowany"] = True
             st.rerun()
         else:
@@ -92,6 +96,14 @@ if not sklepy_wszystkie:
 
 
 # ── formularz: wyciąg + miesiąc + sklepy ─────────────────────────────────────
+st.info(
+    "**Zanim wgrasz wyciąg:** zaloguj się na "
+    "[allegro.pl/logowanie](https://allegro.pl/logowanie) do sklepów "
+    "**pigmejka** i **decor4** — każdy w osobnej przeglądarce (np. pigmejka w "
+    "Safari, decor4 w Chrome). Dzięki temu autoryzacja poniżej zadziała bez "
+    "przełączania się między kontami."
+)
+
 plik = st.file_uploader("Wgraj wyciąg bankowy (PDF)", type="pdf")
 
 col_rok, col_miesiac = st.columns(2)
@@ -114,6 +126,8 @@ if sklepy and len(sklepy) < len(sklepy_wszystkie):
         ) + ") po prostu nie pojawią się w wyniku, bo nie są sprawdzane."
     )
 
+# Przycisk zablokowany dopóki nie ma wgranego pliku i przynajmniej jednego
+# wybranego sklepu — nie ma sensu odpalać rozliczenia bez tych dwóch rzeczy.
 rozlicz_kliknieto = st.button("Rozlicz", type="primary", disabled=plik is None or not sklepy)
 
 
@@ -122,76 +136,106 @@ def autoryzuj_w_appce(nazwa_sklepu, client_id, client_secret, status):
     Wersja OAuth device flow dopasowana do Streamlit: link zamiast input().
     Różne sklepy mogą być zalogowane w różnych przeglądarkach (np. pigmejka
     w Safari, decor4 w Chrome) — nie wystarczy przycisk, który otwiera link
-    w BIEŻĄCEJ przeglądarce. Link jest więc też pokazany jako tekst do
-    skopiowania (st.code ma wbudowany przycisk kopiowania), żeby dało się
-    go wkleić w dowolną przeglądarkę z odpowiednim kontem zalogowanym.
+    w BIEŻĄCEJ przeglądarce. Link jest więc też dostępny do skopiowania (pod
+    "Inna przeglądarka?"), żeby dało się go wkleić tam gdzie odpowiednie
+    konto jest zalogowane.
     """
     device = zainicjuj_device_flow(client_id, client_secret)
-    status.write(
-        f"**{nazwa_sklepu}**: zatwierdź dostęp w Allegro (skopiuj link poniżej "
-        f"do przeglądarki, w której jesteś zalogowana na to konto), "
-        f"potem wróć tutaj — czekam automatycznie."
-    )
-    status.code(device["verification_uri_complete"], language=None)
-    status.link_button(
-        f"...albo otwórz w tej przeglądarce →",
-        device["verification_uri_complete"],
-    )
+    with status.container(border=True):
+        st.markdown(f"**{nazwa_sklepu}** — zatwierdź dostęp w Allegro")
+        st.caption(
+            "Otwórz w przeglądarce, w której jesteś zalogowana na to konto, "
+            "i zatwierdź dostęp — wracam tu automatycznie."
+        )
+        col_btn, col_link = st.columns([1, 1])
+        col_btn.link_button(
+            "Zatwierdź dostęp →", device["verification_uri_complete"], type="primary"
+        )
+        with col_link.popover("Inna przeglądarka?"):
+            st.caption("Skopiuj link i wklej go tam, gdzie jesteś zalogowana:")
+            st.code(device["verification_uri_complete"], language=None)
     with st.spinner(f"Czekam na zatwierdzenie dostępu dla {nazwa_sklepu}..."):
         return czekaj_na_token(client_id, client_secret, device, nazwa_sklepu)
 
 
 if rozlicz_kliknieto and plik is not None:
+    # plik.read() daje bajty wgranego pliku w pamięci, ale parsuj_pdf_mbank
+    # (pdftotext) i zaznacz_dopasowane (fitz) potrzebują ścieżki do
+    # prawdziwego pliku na dysku — stąd zapis do tymczasowego pliku,
+    # usuwanego na końcu w bloku finally.
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(plik.read())
         sciezka_pdf = tmp.name
 
     try:
         with st.status("Przetwarzam wyciąg...", expanded=True) as status:
-            status.write("Parsuję wyciąg PDF...")
+            status.markdown("Parsuję wyciąg PDF...")
             try:
                 wyciag_przelewy = parsuj_pdf_mbank(sciezka_pdf)
             except RuntimeError as e:
                 status.update(label="Błąd parsowania PDF", state="error")
                 st.error(str(e))
                 st.stop()
-            status.write(f"Znaleziono {len(wyciag_przelewy)} przelewów Allegro Finance w wyciągu.")
+            status.markdown(
+                f"Znaleziono **{len(wyciag_przelewy)}** przelewów Allegro Finance w wyciągu."
+            )
 
             date_od, date_do, miesiac_od = zakres_dat(int(rok), int(miesiac))
 
             wiersze_csv = []
-            stats_wszystkie = {}
 
             for sklep in sklepy:
-                status.write(f"Logowanie do **{sklep['nazwa']}**...")
-                auth_headers = autoryzuj_w_appce(
-                    sklep["nazwa"], sklep["client_id"], sklep["client_secret"], status
-                )
-                status.write(f"Pobieram i dopasowuję dane dla **{sklep['nazwa']}**...")
-                wiersze, stats, _ = rozlicz_sklep(
-                    sklep["nazwa"], auth_headers, date_od, date_do, miesiac_od, wyciag_przelewy
-                )
+                status.divider()
+                try:
+                    auth_headers = autoryzuj_w_appce(
+                        sklep["nazwa"], sklep["client_id"], sklep["client_secret"], status
+                    )
+                except RuntimeError as e:
+                    status.update(label="Błąd autoryzacji Allegro", state="error")
+                    st.error(str(e))
+                    st.stop()
+                with st.spinner(f"Pobieram i dopasowuję dane dla {sklep['nazwa']}..."):
+                    wiersze, _stats, _operacje = rozlicz_sklep(
+                        sklep["nazwa"], auth_headers, date_od, date_do, miesiac_od, wyciag_przelewy
+                    )
                 wiersze_csv.extend(wiersze)
-                for operator, dane in stats.items():
-                    stats_wszystkie[(sklep["nazwa"], operator)] = dane
-                status.write(f"✅ {sklep['nazwa']} gotowe.")
+                status.markdown(f"**{sklep['nazwa']}** gotowe.")
 
             # sortowanie chronologiczne wg daty z wyciągu — bez tego wiersze
             # są w kolejności w jakiej przetwarzane były sklepy/operatory
             wiersze_csv.sort(key=lambda w: w["data"])
 
+            # W tym momencie każdy wpis w wyciag_przelewy ma już ustaloną
+            # ostateczną flagę "uzyta" (po wszystkich sklepach) — dokładnie to,
+            # czego potrzeba do podświetlenia PDF-a. Błąd tutaj (np. plik PDF
+            # w nietypowym formacie, którego fitz nie otworzy) nie powinien
+            # zablokować dostępu do gotowej tabeli/CSV, więc tylko ostrzegamy.
+            status.markdown("Przygotowuję podświetlony PDF...")
+            try:
+                pdf_podswietlony = zaznacz_dopasowane(sciezka_pdf, wyciag_przelewy)
+            except Exception as e:
+                status.markdown(
+                    f"Nie udało się przygotować podświetlonego PDF ({e}) — "
+                    "tabela i CSV działają normalnie."
+                )
+                pdf_podswietlony = None
+
             status.update(label="Gotowe!", state="complete")
 
         st.session_state["wyniki"] = {
             "wiersze_csv": wiersze_csv,
-            "stats_wszystkie": stats_wszystkie,
             "miesiac_od": miesiac_od,
+            "pdf_podswietlony": pdf_podswietlony,
         }
     finally:
         os.unlink(sciezka_pdf)
 
 
 # ── wyniki ────────────────────────────────────────────────────────────────────
+# Wynik trzymany w session_state (nie w zwykłej zmiennej) — Streamlit od
+# nowa wykonuje CAŁY skrypt przy każdej interakcji (np. kliknięcie wiersza
+# tabeli niżej), więc bez tego tabela i przyciski pobrania znikałyby po
+# każdym takim kliknięciu zamiast zostać na ekranie.
 if "wyniki" in st.session_state:
     wyniki = st.session_state["wyniki"]
     wiersze_csv = wyniki["wiersze_csv"]
@@ -210,6 +254,9 @@ if "wyniki" in st.session_state:
         selection_mode="single-row",
     )
 
+    # zdarzenie.selection.rows to lista indeksów zaznaczonych wierszy tabeli
+    # (dzięki on_select="rerun" wyżej) — przy selection_mode="single-row"
+    # ma co najwyżej jeden element.
     wybrane = zdarzenie.selection.rows if zdarzenie and zdarzenie.selection else []
     if wybrane:
         wiersz = wiersze_csv[wybrane[0]]
@@ -232,18 +279,21 @@ if "wyniki" in st.session_state:
             else:
                 st.caption("Brak zwrotów w tym oknie.")
 
+    col_csv, col_pdf = st.columns(2)
+
     csv_bytes = df_widok.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "⬇️ Pobierz CSV (do księgowej)",
+    col_csv.download_button(
+        "Pobierz CSV (do księgowej)",
         data=csv_bytes,
         file_name=f"rozliczenie_{wyniki['miesiac_od'][:7]}.csv",
         mime="text/csv",
     )
 
-    stats_dla_llm = [
-        {"sklep": sklep, "operator": operator, **dane}
-        for (sklep, operator), dane in wyniki["stats_wszystkie"].items()
-    ]
-    podsumowanie = generuj_podsumowanie_llm(stats_dla_llm)
-    if podsumowanie:
-        st.info(podsumowanie)
+    if wyniki.get("pdf_podswietlony"):
+        col_pdf.download_button(
+            "Pobierz wyciąg z zaznaczeniami (PDF)",
+            data=wyniki["pdf_podswietlony"],
+            file_name=f"wyciag_zaznaczony_{wyniki['miesiac_od'][:7]}.pdf",
+            mime="application/pdf",
+        )
+        col_pdf.caption("Zielone wiersze = już rozliczone. Reszta — do sprawdzenia ręcznie.")

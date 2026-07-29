@@ -23,7 +23,7 @@ KWOTA_RE = re.compile(r'\b(\d{1,3}(?:[ \xa0]\d{3})*),(\d{2})\b')
 DATA_LINIA_RE = re.compile(r'^\s*(\d{4}-\d{2}-\d{2})')
 
 
-def _kwota_z_liczb(matches):
+def kwota_z_liczb(matches):
     """Przetwarza wyniki KWOTA_RE.findall na float."""
     wynik = []
     for tys, gr in matches:
@@ -75,7 +75,7 @@ def parsuj_pdf_mbank(sciezka):
             dopasowanie_daty = DATA_LINIA_RE.match(linie[j])
             if dopasowanie_daty:
                 if j not in przetworzone:
-                    liczby = _kwota_z_liczb(KWOTA_RE.findall(linie[j]))
+                    liczby = kwota_z_liczb(KWOTA_RE.findall(linie[j]))
                     if liczby:
                         przelewy.append({
                             "data": dopasowanie_daty.group(1),

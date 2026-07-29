@@ -78,6 +78,32 @@ def _kupujacy_jako_lista(operacje, auth_headers, stan_faktur):
     return wynik
 
 
+def _znajdz_najblizszy(wyciag_przelewy, pasuje_kwota, data_api):
+    """
+    Wspólna logika dopasowania używana w obu przebiegach (PLN i waluty
+    obce) — różnią się tylko tym, CO znaczy "kwota pasuje" (patrz
+    pasuje_kwota, przekazywane jako funkcja przez wywołującego).
+
+    Wśród jeszcze niewykorzystanych wpisów z wyciągu ("uzyta"=False), w
+    tolerancji ±TOLERANCJA_DNI dni od data_api, zwraca ten z najbliższą
+    datą, dla którego pasuje_kwota(wpis["kwota"]) jest prawdziwe — albo
+    None, jeśli żaden nie pasuje. Od razu oznacza znaleziony wpis jako
+    "uzyta" (mutacja w miejscu — ta sama pula wyciag_przelewy jest
+    współdzielona między kolejnymi sklepami/operatorami/walutami, patrz
+    rozlicz_sklep, żeby jeden wpis z wyciągu nie trafił do dwóch miejsc).
+    """
+    kandydaci = sorted(
+        (w for w in wyciag_przelewy
+         if not w["uzyta"] and pasuje_kwota(w["kwota"])
+         and abs((date.fromisoformat(w["data"]) - data_api).days) <= TOLERANCJA_DNI),
+        key=lambda w: abs((date.fromisoformat(w["data"]) - data_api).days)
+    )
+    if not kandydaci:
+        return None
+    kandydaci[0]["uzyta"] = True
+    return kandydaci[0]
+
+
 def _przetworz_okna(nazwa_sklepu, nazwa_op, waluta, wyplaty_dopasowane, wplaty, zwroty_op,
                      prev_time_start, auth_headers, stan_faktur, wiersze_csv_sklepu, stats_operator_sklepu):
     """
@@ -235,15 +261,11 @@ def rozlicz_sklep(nazwa_sklepu, auth_headers, date_od, date_do, miesiac_od, wyci
         for o in wyplaty_all:
             kwota_abs = round(abs(float(o["value"]["amount"])), 2)
             data_api  = data_lokalna(o["occurredAt"])
-            kandydaci = sorted(
-                (w for w in wyciag_przelewy
-                 if not w["uzyta"] and w["kwota"] == kwota_abs
-                 and abs((date.fromisoformat(w["data"]) - data_api).days) <= TOLERANCJA_DNI),
-                key=lambda w: abs((date.fromisoformat(w["data"]) - data_api).days)
+            wpis = _znajdz_najblizszy(
+                wyciag_przelewy, lambda k, kwota_abs=kwota_abs: k == kwota_abs, data_api
             )
-            if kandydaci:
-                kandydaci[0]["uzyta"] = True
-                wyplaty_dopasowane.append((o, kandydaci[0]))
+            if wpis:
+                wyplaty_dopasowane.append((o, wpis))
 
         if not wyplaty_dopasowane:
             continue
@@ -290,16 +312,14 @@ def rozlicz_sklep(nazwa_sklepu, auth_headers, date_od, date_do, miesiac_od, wyci
                           f"z {data_api}, sprawdź ręcznie.")
                     continue
                 oczekiwana_pln = kwota_oryg_abs * kurs
-                kandydaci = sorted(
-                    (w for w in wyciag_przelewy
-                     if not w["uzyta"]
-                     and abs(w["kwota"] - oczekiwana_pln) <= TOLERANCJA_KURSU * oczekiwana_pln
-                     and abs((date.fromisoformat(w["data"]) - data_api).days) <= TOLERANCJA_DNI),
-                    key=lambda w: abs((date.fromisoformat(w["data"]) - data_api).days)
+                wpis = _znajdz_najblizszy(
+                    wyciag_przelewy,
+                    lambda k, oczekiwana_pln=oczekiwana_pln:
+                        abs(k - oczekiwana_pln) <= TOLERANCJA_KURSU * oczekiwana_pln,
+                    data_api,
                 )
-                if kandydaci:
-                    kandydaci[0]["uzyta"] = True
-                    wyplaty_dopasowane.append((o, kandydaci[0]))
+                if wpis:
+                    wyplaty_dopasowane.append((o, wpis))
                 else:
                     print(f"    UWAGA: nie znaleziono w wyciągu przelewu pasującego do wypłaty "
                           f"{waluta} {kwota_oryg_abs} z {data_api} (oczekiwano ok. {oczekiwana_pln:.2f} PLN "
