@@ -1,6 +1,6 @@
-requests
-python-dotenv
-streamlit
-pandas
-watchdog
-pymupdf
+requests==2.34.2
+python-dotenv==1.2.2
+streamlit==1.59.2
+pandas==3.0.3
+watchdog==6.0.0
+pymupdf==1.28.0
